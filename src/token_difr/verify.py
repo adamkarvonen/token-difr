@@ -467,7 +467,7 @@ def verify_outputs(
         print(f"  Total tokens: {summary['total_tokens']}")
         print(f"  Exact match rate: {summary['exact_match_rate']:.2%}")
         print(f"  Average probability: {summary['avg_prob']:.4f}")
-        print(f"  Average margin: {summary['avg_margin']:.4f}")
+        print(f"  Average margin: {summary['avg_margin']:.4f} ({summary['infinite_margin_rate']:.2%} infinite)")
 
     return all_token_metrics
 
@@ -484,14 +484,18 @@ def compute_metrics_summary(results: list[list[TokenMetrics]]) -> dict[str, Any]
             - total_tokens: Total number of tokens verified
             - exact_match_rate: Fraction of tokens that matched exactly
             - avg_prob: Average probability of actual tokens
-            - avg_margin: Average margin between max and actual token scores
+            - avg_margin: Average margin for non-infinite values
+            - infinite_margin_rate: Fraction of tokens with infinite margin
             - avg_logit_rank: Average logit rank of actual tokens
             - avg_gumbel_rank: Average Gumbel rank of actual tokens
     """
+    import math
+
     total_tokens = 0
     total_matches = 0
     total_prob = 0.0
     total_margin = 0.0
+    finite_margin_count = 0
     total_logit_rank = 0.0
     total_gumbel_rank = 0.0
 
@@ -501,7 +505,9 @@ def compute_metrics_summary(results: list[list[TokenMetrics]]) -> dict[str, Any]
             if m.exact_match:
                 total_matches += 1
             total_prob += m.prob
-            total_margin += m.margin
+            if math.isfinite(m.margin):
+                total_margin += m.margin
+                finite_margin_count += 1
             total_logit_rank += m.logit_rank
             total_gumbel_rank += m.gumbel_rank
 
@@ -511,15 +517,20 @@ def compute_metrics_summary(results: list[list[TokenMetrics]]) -> dict[str, Any]
             "exact_match_rate": 0.0,
             "avg_prob": 0.0,
             "avg_margin": 0.0,
+            "infinite_margin_rate": 0.0,
             "avg_logit_rank": 0.0,
             "avg_gumbel_rank": 0.0,
         }
+
+    infinite_margin_count = total_tokens - finite_margin_count
+    avg_margin = total_margin / finite_margin_count if finite_margin_count > 0 else float("inf")
 
     return {
         "total_tokens": total_tokens,
         "exact_match_rate": total_matches / total_tokens,
         "avg_prob": total_prob / total_tokens,
-        "avg_margin": total_margin / total_tokens,
+        "avg_margin": avg_margin,
+        "infinite_margin_rate": infinite_margin_count / total_tokens,
         "avg_logit_rank": total_logit_rank / total_tokens,
         "avg_gumbel_rank": total_gumbel_rank / total_tokens,
     }

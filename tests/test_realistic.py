@@ -1,17 +1,16 @@
-"""Test with more tokens to see realistic exact match rates."""
+"""End-to-end tests for token-difr."""
 
 import gc
+import os
 
+import pytest
 import torch
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
-from token_difr import TokenMetrics, TokenSequence, verify_outputs
+from token_difr import TokenSequence, compute_metrics_summary, verify_outputs
 
-import sys
-
-# Allow model to be specified via command line
-MODEL_NAME = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-1.7B"
+MODEL_NAME = os.environ.get("TEST_MODEL", "Qwen/Qwen3-1.7B")
 
 TEST_PROMPTS = [
     "What is the capital of France?",
@@ -25,8 +24,9 @@ TEST_PROMPTS = [
 ]
 
 
-def generate_outputs_vllm(model_name, prompts, temperature, top_k, top_p, seed, max_tokens=100):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+def generate_outputs_vllm(prompts, temperature, top_k, top_p, seed, max_tokens=100):
+    """Generate outputs using vLLM for testing."""
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenized_prompts = []
     for prompt in prompts:
         messages = [{"role": "user", "content": prompt}]
@@ -36,7 +36,7 @@ def generate_outputs_vllm(model_name, prompts, temperature, top_k, top_p, seed, 
     del tokenizer
 
     model = LLM(
-        model=model_name,
+        model=MODEL_NAME,
         tensor_parallel_size=1,
         max_model_len=4096,
         enforce_eager=True,
@@ -69,52 +69,80 @@ def generate_outputs_vllm(model_name, prompts, temperature, top_k, top_p, seed, 
     return outputs
 
 
-def compute_exact_match_rate(results):
-    total_tokens = 0
-    total_matches = 0
-    for seq_metrics in results:
-        for token_metrics in seq_metrics:
-            total_tokens += 1
-            if token_metrics.exact_match:
-                total_matches += 1
-    if total_tokens == 0:
-        return 0.0
-    return total_matches / total_tokens
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_verify_outputs(temperature):
+    """Test verification achieves >= 98% exact match and all metrics/summary fields are valid."""
+    top_k = 50
+    top_p = 0.95
+    seed = 42
+    max_tokens = 500
+    min_match_rate = 0.98
 
+    # Generate outputs
+    outputs = generate_outputs_vllm(
+        prompts=TEST_PROMPTS,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        seed=seed,
+        max_tokens=max_tokens,
+    )
 
-if __name__ == "__main__":
-    for temp in [0.0, 1.0]:
-        print(f"\n{'='*60}")
-        print(f"Temperature {temp}, max_tokens=500")
-        print("=" * 60)
+    total_tokens = sum(len(o.output_token_ids) for o in outputs)
+    assert total_tokens > 0, "Should generate at least some tokens"
 
-        outputs = generate_outputs_vllm(
-            model_name=MODEL_NAME,
-            prompts=TEST_PROMPTS,
-            temperature=temp,
-            top_k=50,
-            top_p=0.95,
-            seed=42,
-            max_tokens=500,
+    # Verify outputs
+    results = verify_outputs(
+        outputs,
+        model_name=MODEL_NAME,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        seed=seed,
+    )
+
+    # Check results structure
+    assert len(results) == len(outputs), "Should have results for each output sequence"
+    for seq_idx, seq_results in enumerate(results):
+        assert len(seq_results) == len(outputs[seq_idx].output_token_ids), (
+            f"Sequence {seq_idx}: should have metrics for each token"
         )
 
-        total_tokens = sum(len(o.output_token_ids) for o in outputs)
-        print(f"Generated {total_tokens} total tokens across {len(outputs)} sequences")
+    # Check TokenMetrics fields
+    for seq_results in results:
+        for metrics in seq_results:
+            assert isinstance(metrics.exact_match, bool)
+            assert isinstance(metrics.prob, float)
+            assert isinstance(metrics.margin, float)
+            assert isinstance(metrics.logit_rank, (int, float))
+            assert isinstance(metrics.gumbel_rank, (int, float))
+            assert 0.0 <= metrics.prob <= 1.0, f"prob should be in [0, 1], got {metrics.prob}"
+            assert metrics.logit_rank >= 0, f"logit_rank should be >= 0, got {metrics.logit_rank}"
+            assert metrics.gumbel_rank >= 0, f"gumbel_rank should be >= 0, got {metrics.gumbel_rank}"
 
-        results = verify_outputs(
-            outputs,
-            model_name=MODEL_NAME,
-            temperature=temp,
-            top_k=50,
-            top_p=0.95,
-            seed=42,
-        )
+    # Check compute_metrics_summary
+    summary = compute_metrics_summary(results)
+    expected_keys = [
+        "total_tokens",
+        "exact_match_rate",
+        "avg_prob",
+        "avg_margin",
+        "infinite_margin_rate",
+        "avg_logit_rank",
+        "avg_gumbel_rank",
+    ]
+    for key in expected_keys:
+        assert key in summary, f"Missing key: {key}"
+    assert summary["total_tokens"] == total_tokens
+    assert 0.0 <= summary["exact_match_rate"] <= 1.0
+    assert 0.0 <= summary["avg_prob"] <= 1.0
+    assert 0.0 <= summary["infinite_margin_rate"] <= 1.0
+    assert summary["avg_logit_rank"] >= 0.0
+    assert summary["avg_gumbel_rank"] >= 0.0
 
-        rate = compute_exact_match_rate(results)
-        matches = int(rate * total_tokens)
-        print(f"Exact match rate: {rate:.4%} ({matches}/{total_tokens})")
-
-        if rate < 0.98:
-            print(f"WARNING: Match rate {rate:.2%} is below 98% threshold!")
-        else:
-            print("PASSED: Match rate >= 98%")
+    # Check match rate
+    assert summary["exact_match_rate"] >= min_match_rate, (
+        f"Temperature {temperature}: exact match rate {summary['exact_match_rate']:.2%} "
+        f"is below {min_match_rate:.0%} threshold"
+    )

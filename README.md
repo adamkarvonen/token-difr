@@ -12,7 +12,7 @@ pip install token-difr
 
 - Python >= 3.10
 - PyTorch >= 2.0.0
-- vLLM >= 0.11.0
+- vLLM >= 0.10.1
 - CUDA-capable GPU
 
 ## Quick Start
@@ -129,13 +129,31 @@ def compute_metrics_summary(results: list[list[TokenMetrics]]) -> dict:
     #     "total_tokens": int,
     #     "exact_match_rate": float,
     #     "avg_prob": float,
-    #     "avg_margin": float,
+    #     "avg_margin": float,           # Average of non-infinite margins
+    #     "infinite_margin_rate": float, # Fraction of tokens with infinite margin
     #     "avg_logit_rank": float,
     #     "avg_gumbel_rank": float,
     # }
 ```
 
 ## Advanced Usage
+
+### Temperature Zero Verification
+
+If you don't know the exact sampling process of a provider, or if a provider doesn't support per-request sampling seeds, you can still verify outputs using temperature zero (greedy decoding). With `temperature=0`, the model deterministically selects the highest-probability token at each step, so the `top_k`, `top_p`, and `seed` parameters have no effect on the output.
+
+In this case, pass arbitrary default values for the required parameters:
+
+```python
+results = verify_outputs(
+    outputs,
+    model_name="meta-llama/Llama-3.1-8B-Instruct",
+    temperature=0.0,  # Greedy decoding - deterministic
+    top_k=50,         # Ignored when temperature=0
+    top_p=0.95,       # Ignored when temperature=0
+    seed=0,           # Ignored when temperature=0
+)
+```
 
 ### Using Quantization
 
@@ -176,6 +194,21 @@ results = verify_outputs(
 ## Environment Variables
 
 The package automatically sets `VLLM_USE_V1=1` (using `setdefault`, so you can override before importing). This enables vLLM v1 features required for prompt logprobs.
+
+## Development
+
+### Running Tests
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+You can specify a different model for testing via environment variable:
+
+```bash
+TEST_MODEL=Qwen/Qwen3-1.7B pytest tests/ -v
+```
 
 ## License
 

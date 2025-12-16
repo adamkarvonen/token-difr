@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
-    "vllm>=0.11.0",
+    "vllm>=0.10.1",
     "tqdm>=4.0.0",
 ]
 
