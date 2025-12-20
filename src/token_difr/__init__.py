@@ -1,17 +1,19 @@
 """Token verification using Gumbel-Max sampling for LLM outputs."""
 
-from token_difr.verify import (
+from token_difr.api import verify_outputs_tinker
+from token_difr.common import (
     SamplingMethod,
     TokenMetrics,
     TokenSequence,
     compute_metrics_summary,
-    verify_outputs,
 )
+from token_difr.local import verify_outputs
 
 __version__ = "0.1.1"
 
 __all__ = [
     "verify_outputs",
+    "verify_outputs_tinker",
     "TokenSequence",
     "TokenMetrics",
     "SamplingMethod",

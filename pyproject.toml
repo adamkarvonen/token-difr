@@ -22,11 +22,14 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
-    "vllm>=0.10.1",
     "tqdm>=4.0.0",
+    "tinker",
 ]
 
 [project.optional-dependencies]
+all = [
+    "vllm>=0.10.1",
+]
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.1.0",
