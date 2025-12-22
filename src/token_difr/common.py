@@ -10,6 +10,118 @@ from typing import Any
 import torch
 
 
+def encode_thinking_response(
+    content: str,
+    reasoning: str | None,
+    tokenizer,
+    max_tokens: int | None = None,
+) -> list[int]:
+    """Encode a thinking model response to token IDs.
+
+    For thinking models (Kimi-K2, QwQ, DeepSeek-R1, etc.), the model outputs:
+        <think>reasoning</think>content
+
+    OpenRouter returns reasoning in a separate field, so we need to reconstruct
+    the full token sequence.
+
+    Args:
+        content: The main response content.
+        reasoning: The reasoning/thinking content (may be None or empty).
+        tokenizer: HuggingFace tokenizer for the model.
+        max_tokens: Optional maximum number of tokens to return.
+
+    Returns:
+        List of token IDs representing the full response.
+    """
+    if reasoning:
+        full_response = f"<think>{reasoning}</think>{content}"
+    else:
+        full_response = content
+
+    token_ids = tokenizer.encode(full_response, add_special_tokens=False)
+
+    if max_tokens is not None:
+        token_ids = token_ids[:max_tokens]
+
+    return token_ids
+
+
+def construct_prompts(
+    n_prompts: int = 100,
+    max_ctx_len: int = 512,
+    tokenizer=None,
+    model_name: str | None = None,
+    custom_prompts: list[list[dict[str, str]]] | None = None,
+) -> list[list[dict[str, str]]]:
+    """Construct a dataset of conversation prompts for testing.
+
+    By default, loads prompts from the WildChat dataset (lmsys/lmsys-chat-1m),
+    filtering for English conversations that end with a user message.
+
+    Args:
+        n_prompts: Number of prompts to return.
+        max_ctx_len: Maximum context length in tokens (prompts longer than this are skipped).
+        tokenizer: HuggingFace tokenizer for filtering by length. If None and model_name
+            is provided, will load the tokenizer automatically.
+        model_name: Model name to load tokenizer from if tokenizer is None.
+        custom_prompts: Optional list of custom prompts to use instead of loading
+            from the dataset. If provided, other parameters are ignored.
+
+    Returns:
+        List of conversation prompts, where each prompt is a list of message dicts
+        with 'role' and 'content' keys.
+    """
+    if custom_prompts is not None:
+        return custom_prompts[:n_prompts]
+
+    # Import here to avoid dependency issues if not using this function
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    # Load or create tokenizer
+    if tokenizer is None:
+        if model_name is None:
+            raise ValueError("Either tokenizer or model_name must be provided")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    ds = load_dataset("allenai/WildChat-1M", split="train")
+
+    conversation_prompts: list[list[dict[str, str]]] = []
+    unique_prompts: set[tuple[int, ...]] = set()
+
+    idx = 0
+    while len(conversation_prompts) < n_prompts and idx < len(ds):
+        sample = ds[idx]
+        idx += 1
+
+        # Filter for English only
+        if sample["language"].lower() != "english":  # type: ignore[index]
+            continue
+
+        # Get conversation and ensure it ends with a user message
+        # Only keep 'role' and 'content' fields to avoid non-serializable types
+        raw_conversation = sample["conversation"]  # type: ignore[index]
+        conversation = [{"role": msg["role"], "content": msg["content"]} for msg in raw_conversation]
+
+        while conversation and conversation[-1].get("role") == "assistant":
+            conversation = conversation[:-1]
+
+        if not conversation or conversation[-1].get("role") != "user":
+            continue
+
+        # Tokenize to check length and uniqueness
+        rendered = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+        token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+
+        if len(token_ids) <= max_ctx_len:
+            prompt_key = tuple(token_ids)
+            if prompt_key not in unique_prompts:
+                unique_prompts.add(prompt_key)
+                conversation_prompts.append(conversation)
+
+    return conversation_prompts
+
+
 class SamplingMethod(Enum):
     """Supported sampling methods for verification."""
 

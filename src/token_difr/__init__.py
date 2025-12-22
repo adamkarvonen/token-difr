@@ -6,6 +6,8 @@ from token_difr.common import (
     TokenMetrics,
     TokenSequence,
     compute_metrics_summary,
+    construct_prompts,
+    encode_thinking_response,
 )
 from token_difr.local import verify_outputs
 
@@ -18,5 +20,7 @@ __all__ = [
     "TokenMetrics",
     "SamplingMethod",
     "compute_metrics_summary",
+    "construct_prompts",
+    "encode_thinking_response",
     "__version__",
 ]
