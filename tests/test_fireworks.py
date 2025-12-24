@@ -1,8 +1,9 @@
-"""End-to-end tests for token-difr using Tinker API backend."""
+"""End-to-end tests for token-difr using Fireworks API backend."""
 
 import os
 
 import pytest
+from openai import OpenAI
 from transformers import AutoTokenizer
 
 from token_difr import TokenSequence, compute_metrics_summary, verify_outputs_api
@@ -15,12 +16,9 @@ try:
 except ImportError:
     pass
 
-MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-# MODEL_NAME = "Qwen/Qwen3-8B"
-# MODEL_NAME = "openai/gpt-oss-120b"
-# MODEL_NAME = "moonshotai/Kimi-K2-Thinking"
-# MODEL_NAME = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-# MODEL_NAME = "deepseek-ai/DeepSeek-V3.1"
+# Fireworks model name and corresponding HuggingFace model for tokenizer
+FIREWORKS_MODEL = "accounts/fireworks/models/llama-v3p3-70b-instruct"
+HF_MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
 TEST_PROMPTS = [
     "What is the capital of France?",
@@ -34,107 +32,96 @@ TEST_PROMPTS = [
 ]
 
 
-def get_tinker_api_key():
-    """Get Tinker API key from environment."""
-    api_key = os.environ.get("TINKER_API_KEY")
+def get_fireworks_api_key():
+    """Get Fireworks API key from environment."""
+    api_key = os.environ.get("FIREWORKS_API_KEY")
     if not api_key:
-        pytest.skip("TINKER_API_KEY environment variable not set")
+        pytest.skip("FIREWORKS_API_KEY environment variable not set")
     return api_key
 
 
-def generate_outputs_tinker(sampling_client, prompts, temperature, top_k, top_p, seed, max_tokens=100):
-    """Generate outputs using Tinker API for testing.
+def generate_outputs_fireworks(client, tokenizer, prompts, temperature, max_tokens=100):
+    """Generate outputs using Fireworks API for testing.
 
     Returns:
         Tuple of (outputs, vocab_size) where outputs is a list of TokenSequence
         and vocab_size is derived from the tokenizer.
     """
-    import tinker
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     vocab_size = len(tokenizer)
 
-    # Prepare all prompts and submit requests in parallel
-    prompt_token_ids_list = []
-    futures = []
+    outputs = []
     for prompt in prompts:
         messages = [{"role": "user", "content": prompt}]
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         prompt_token_ids = tokenizer.encode(rendered, add_special_tokens=False)
-        prompt_token_ids_list.append(prompt_token_ids)
 
-        # Submit request (returns a Future)
-        prompt_input = tinker.ModelInput.from_ints(prompt_token_ids)
-        params = tinker.SamplingParams(
+        # Generate using Fireworks completions API
+        response = client.completions.create(
+            model=FIREWORKS_MODEL,
+            prompt=rendered,
             max_tokens=max_tokens,
             temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            seed=seed,
         )
-        future = sampling_client.sample(
-            prompt=prompt_input,
-            sampling_params=params,
-            num_samples=1,
-        )
-        futures.append(future)
 
-    # Collect all results
-    outputs = []
-    for prompt_token_ids, future in zip(prompt_token_ids_list, futures):
-        result = future.result()
-        generated_tokens = result.sequences[0].tokens
+        generated_text = response.choices[0].text
+        generated_token_ids = tokenizer.encode(generated_text, add_special_tokens=False)
+
         outputs.append(
             TokenSequence(
                 prompt_token_ids=prompt_token_ids,
-                output_token_ids=list(generated_tokens),
+                output_token_ids=generated_token_ids,
             )
         )
 
     return outputs, vocab_size
 
 
-@pytest.mark.parametrize("temperature", [0.0])  # Only greedy for now until Tinker sampling is understood
-def test_verify_outputs_tinker(temperature):
-    """Test Tinker verification achieves >= 98% exact match and all metrics/summary fields are valid."""
-    import tinker
+@pytest.mark.parametrize("temperature", [0.0])
+def test_verify_outputs_fireworks(temperature):
+    """Test Fireworks verification achieves >= 98% exact match and all metrics/summary fields are valid."""
+    api_key = get_fireworks_api_key()
 
-    api_key = get_tinker_api_key()
-
-    top_k = 20  # Tinker limits topk logprobs to 20
+    top_k = 5  # Fireworks default
     top_p = 0.95
     seed = 42
     max_tokens = 100
     min_match_rate = 0.98
 
-    # Create Tinker client
-    service_client = tinker.ServiceClient(api_key=api_key)
-    sampling_client = service_client.create_sampling_client(base_model=MODEL_NAME)
+    # Create Fireworks client
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.fireworks.ai/inference/v1",
+    )
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME, trust_remote_code=True)
+    vocab_size = len(tokenizer)
 
     # Generate outputs
-    outputs, vocab_size = generate_outputs_tinker(
-        sampling_client=sampling_client,
+    outputs, vocab_size = generate_outputs_fireworks(
+        client=client,
+        tokenizer=tokenizer,
         prompts=TEST_PROMPTS,
-        temperature=1e-8,
-        top_k=top_k,
-        top_p=top_p,
-        seed=seed,
+        temperature=1e-8,  # Near-greedy for generation
         max_tokens=max_tokens,
     )
 
     total_tokens = sum(len(o.output_token_ids) for o in outputs)
     assert total_tokens > 0, "Should generate at least some tokens"
 
-    # Verify outputs using Tinker backend
+    # Verify outputs using Fireworks backend
     results = verify_outputs_api(
         outputs,
-        backend="tinker",
+        backend="fireworks",
         vocab_size=vocab_size,
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         seed=seed,
-        sampling_client=sampling_client,
+        client=client,
+        model=FIREWORKS_MODEL,
+        tokenizer=tokenizer,
+        topk_logprobs=5,
     )
 
     # Check results structure

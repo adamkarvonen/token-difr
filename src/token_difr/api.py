@@ -1,6 +1,10 @@
-"""API-based verification using Tinker."""
+"""API-based verification using Tinker and Fireworks backends."""
+
+from concurrent.futures import ThreadPoolExecutor
+from typing import Literal
 
 import torch
+from openai import OpenAI
 from tqdm import tqdm
 
 from token_difr.common import (
@@ -40,6 +44,82 @@ def _tinker_logprobs_to_tensor(
     return logits
 
 
+def _fireworks_logprobs_to_tensor(
+    top_logprobs: list,
+    start_idx: int,
+    n_tokens: int,
+    device: torch.device,
+    vocab_size: int,
+    tokenizer,
+) -> torch.Tensor:
+    """Convert Fireworks/OpenAI-style logprobs into a dense full-vocabulary tensor.
+
+    Fireworks returns logprobs as a list of dicts where each dict maps token string to logprob.
+    """
+    slice_rows = top_logprobs[start_idx : start_idx + n_tokens]
+    if len(slice_rows) != n_tokens:
+        raise ValueError(f"Expected {n_tokens} logprob rows, got {len(slice_rows)}")
+
+    logits = torch.full((n_tokens, vocab_size), float("-inf"), device=device)
+
+    for j, row in enumerate(slice_rows):
+        if row is None:
+            continue
+
+        for token_str, logprob in row.items():
+            # Convert token string to token ID
+            token_ids = tokenizer.encode(token_str, add_special_tokens=False)
+            if len(token_ids) == 1:
+                token_id = token_ids[0]
+                logits[j, token_id] = logprob
+
+    return logits
+
+
+def _submit_tinker_request(
+    prompt_token_ids: list[int],
+    gen_ids: list[int],
+    sampling_client,
+    topk_logprobs: int,
+):
+    """Submit a Tinker request and return the future."""
+    import tinker
+
+    full_sequence = prompt_token_ids + gen_ids
+    full_prompt = tinker.ModelInput.from_ints(full_sequence)
+
+    return sampling_client.sample(
+        prompt=full_prompt,
+        sampling_params=tinker.SamplingParams(max_tokens=1),
+        num_samples=1,
+        include_prompt_logprobs=True,
+        topk_prompt_logprobs=topk_logprobs,
+    )
+
+
+def _fetch_fireworks_logprobs(
+    prompt_token_ids: list[int],
+    gen_ids: list[int],
+    client: OpenAI,
+    model: str,
+    tokenizer,
+    topk_logprobs: int,
+):
+    """Fetch logprobs from Fireworks API (blocking call for use with ThreadPoolExecutor)."""
+    prompt_text = tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
+    output_text = tokenizer.decode(gen_ids, skip_special_tokens=False)
+
+    response = client.completions.create(
+        model=model,
+        prompt=prompt_text + output_text,
+        max_tokens=1,
+        logprobs=topk_logprobs,
+        echo=True,
+    )
+
+    return response.choices[0].logprobs
+
+
 def _compute_verification_metrics_from_logprobs(
     logprobs_JV: torch.Tensor,
     gen_ids: list[int],
@@ -51,10 +131,8 @@ def _compute_verification_metrics_from_logprobs(
 ) -> list[TokenMetrics]:
     """Compute verification metrics from log probabilities (not raw logits).
 
-    This is used for Tinker backend which returns log probs rather than raw logits.
     Currently only supports greedy verification (temperature=0). The signature
-    includes all sampling parameters for future expansion when Tinker's sampling
-    method is understood.
+    includes all sampling parameters for future expansion.
 
     For greedy verification:
     - exact_match: True if claimed token is the argmax of logprobs
@@ -103,133 +181,163 @@ def _compute_verification_metrics_from_logprobs(
 
 
 @torch.inference_mode()
-def verify_outputs_tinker(
+def verify_outputs_api(
     outputs: list[TokenSequence],
-    sampling_client: "tinker.SamplingClient",
+    backend: Literal["tinker", "fireworks"],
     vocab_size: int,
     *,
     temperature: float,
     top_k: int,
     top_p: float,
     seed: int,
+    # Backend-specific args
+    sampling_client=None,  # For Tinker
+    client: OpenAI | None = None,  # For Fireworks
+    model: str | None = None,  # For Fireworks
+    tokenizer=None,  # For Fireworks
     topk_logprobs: int = 20,
     verbose: bool = True,
 ) -> list[list[TokenMetrics]]:
     """
-    Verify LLM outputs using Gumbel-Max sampling verification via Tinker API.
+    Verify LLM outputs using API-based verification.
 
     This function takes token sequences (prompt + generated output) and verifies
     whether the outputs could have been produced by the specified model using
-    the given sampling parameters. Uses the Tinker API to fetch logprobs.
+    the given sampling parameters. Requests are submitted in parallel for efficiency.
 
     Args:
         outputs: List of TokenSequence objects containing prompt and output token IDs.
-        sampling_client: A Tinker SamplingClient instance configured with the model.
-        vocab_size: The vocabulary size of the model (e.g., 128256 for Llama 3.1).
+        backend: Which backend to use ("tinker" or "fireworks").
+        vocab_size: The vocabulary size of the model.
         temperature: Sampling temperature used during generation. Required.
         top_k: Top-k sampling parameter. Required.
         top_p: Top-p (nucleus) sampling parameter. Required.
         seed: Random seed used during generation. Required.
-        topk_logprobs: Number of top logprobs to request from Tinker. Default: 20. (max is 20 for Tinker)
+        sampling_client: A Tinker SamplingClient (required for backend="tinker").
+        client: An OpenAI client configured for Fireworks (required for backend="fireworks").
+        model: The model name for Fireworks (required for backend="fireworks").
+        tokenizer: HuggingFace tokenizer (required for backend="fireworks").
+        topk_logprobs: Number of top logprobs to request. Default: 20.
         verbose: Whether to show progress and print a summary. Default: True.
 
     Returns:
         List of lists of TokenMetrics, one per token in each output sequence.
-        Each TokenMetrics contains:
-            - exact_match: Whether the token matches under verification
-            - prob: Probability of the actual token
-            - margin: Margin between max and actual token scores
-            - logit_rank: Rank of actual token by logit value
-            - gumbel_rank: Rank of actual token by Gumbel score
-
-    Example:
-        >>> import tinker
-        >>> from token_difr import verify_outputs_tinker, TokenSequence
-        >>> service_client = tinker.ServiceClient(api_key="your-api-key")
-        >>> sampling_client = service_client.create_sampling_client(
-        ...     base_model="meta-llama/Llama-3.1-8B-Instruct"
-        ... )
-        >>> outputs = [
-        ...     TokenSequence(
-        ...         prompt_token_ids=[128000, 2323, 374],
-        ...         output_token_ids=[264, 1296, 13]
-        ...     )
-        ... ]
-        >>> results = verify_outputs_tinker(
-        ...     outputs,
-        ...     sampling_client,
-        ...     vocab_size=128256,
-        ...     temperature=1.0,
-        ...     top_k=50,
-        ...     top_p=0.95,
-        ...     seed=42,
-        ... )
     """
-    import tinker
-
-    device = torch.device("cpu")  # Tinker does computation remotely; we only need CPU for metrics
+    device = torch.device("cpu")
 
     all_token_metrics: list[list[TokenMetrics]] = [[] for _ in outputs]
 
-    # Prepare requests and submit all in parallel
+    # Prepare request data
     request_data: list[tuple[int, list[int], list[int]]] = []  # (index, prompt_token_ids, gen_ids)
-    futures: list[tuple[int, object]] = []  # (index, future)
-
     for i, req in enumerate(outputs):
         prompt_token_ids: list[int] = _as_list(req.prompt_token_ids)
         gen_ids: list[int] = _as_list(req.output_token_ids)
-
         if len(gen_ids) == 0:
             continue
-
         request_data.append((i, prompt_token_ids, gen_ids))
 
-        # Concatenate prompt + generated tokens
-        full_sequence = prompt_token_ids + gen_ids
-        full_prompt = tinker.ModelInput.from_ints(full_sequence)
+    if len(request_data) == 0:
+        return all_token_metrics
 
-        # Submit request (returns a Future)
-        future = sampling_client.sample(
-            prompt=full_prompt,
-            sampling_params=tinker.SamplingParams(max_tokens=1),
-            num_samples=1,
-            include_prompt_logprobs=True,
-            topk_prompt_logprobs=topk_logprobs,
-        )
-        futures.append((i, future))
+    # Submit all requests in parallel
+    if backend == "tinker":
+        if sampling_client is None:
+            raise ValueError("sampling_client is required for tinker backend")
 
-    # Collect all results
-    iterator = zip(request_data, futures)
-    if verbose:
-        iterator = tqdm(list(zip(request_data, futures)), desc="Verifying via Tinker API")
+        # Submit all Tinker requests (they return futures)
+        futures = []
+        for i, prompt_token_ids, gen_ids in request_data:
+            future = _submit_tinker_request(
+                prompt_token_ids=prompt_token_ids,
+                gen_ids=gen_ids,
+                sampling_client=sampling_client,
+                topk_logprobs=topk_logprobs,
+            )
+            futures.append((i, prompt_token_ids, gen_ids, future))
 
-    for (i, prompt_token_ids, gen_ids), (_, future) in iterator:
-        logprob_result = future.result()
+        # Collect results
+        iterator = futures
+        if verbose:
+            iterator = tqdm(futures, desc=f"Verifying via {backend} API")
 
-        # Convert Tinker's logprob format to tensor
-        prompt_len = len(prompt_token_ids)
-        gen_len = len(gen_ids)
+        for i, prompt_token_ids, gen_ids, future in iterator:
+            logprob_result = future.result()
+            prompt_len = len(prompt_token_ids)
+            gen_len = len(gen_ids)
 
-        logits_JV = _tinker_logprobs_to_tensor(
-            logprob_result.topk_prompt_logprobs,
-            start_idx=prompt_len,
-            n_tokens=gen_len,
-            device=device,
-            vocab_size=vocab_size,
-        )
+            logprobs_JV = _tinker_logprobs_to_tensor(
+                logprob_result.topk_prompt_logprobs,
+                start_idx=prompt_len,
+                n_tokens=gen_len,
+                device=device,
+                vocab_size=vocab_size,
+            )
 
-        # Compute verification metrics using log probs (not raw logits)
-        seq_token_metrics = _compute_verification_metrics_from_logprobs(
-            logprobs_JV=logits_JV,  # These are actually log probs from Tinker
-            gen_ids=gen_ids,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            seed=seed,
-            device=device,
-        )
+            seq_token_metrics = _compute_verification_metrics_from_logprobs(
+                logprobs_JV=logprobs_JV,
+                gen_ids=gen_ids,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                device=device,
+            )
+            all_token_metrics[i] = seq_token_metrics
 
-        all_token_metrics[i] = seq_token_metrics
+    elif backend == "fireworks":
+        if client is None or model is None or tokenizer is None:
+            raise ValueError("client, model, and tokenizer are required for fireworks backend")
+
+        # Submit all Fireworks requests using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = []
+            for i, prompt_token_ids, gen_ids in request_data:
+                future = executor.submit(
+                    _fetch_fireworks_logprobs,
+                    prompt_token_ids=prompt_token_ids,
+                    gen_ids=gen_ids,
+                    client=client,
+                    model=model,
+                    tokenizer=tokenizer,
+                    topk_logprobs=topk_logprobs,
+                )
+                futures.append((i, prompt_token_ids, gen_ids, future))
+
+            # Collect results
+            iterator = futures
+            if verbose:
+                iterator = tqdm(futures, desc=f"Verifying via {backend} API")
+
+            for i, prompt_token_ids, gen_ids, future in iterator:
+                logprobs_data = future.result()
+                prompt_len = len(prompt_token_ids)
+                gen_len = len(gen_ids)
+
+                # +1 for the empty token Fireworks prepends
+                start_idx = prompt_len + 1
+
+                logprobs_JV = _fireworks_logprobs_to_tensor(
+                    logprobs_data.top_logprobs,
+                    start_idx=start_idx,
+                    n_tokens=gen_len,
+                    device=device,
+                    vocab_size=vocab_size,
+                    tokenizer=tokenizer,
+                )
+
+                seq_token_metrics = _compute_verification_metrics_from_logprobs(
+                    logprobs_JV=logprobs_JV,
+                    gen_ids=gen_ids,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    seed=seed,
+                    device=device,
+                )
+                all_token_metrics[i] = seq_token_metrics
+
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
 
     if verbose:
         summary = compute_metrics_summary(all_token_metrics)
