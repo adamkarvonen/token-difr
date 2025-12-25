@@ -1,11 +1,11 @@
 """API-based verification using Tinker and Fireworks backends."""
 
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from dataclasses import dataclass
-from typing import Iterator, Literal
+from typing import Iterator
 
 import torch
-from openai import OpenAI
+from openai import AsyncOpenAI
 from openai.types.completion_choice import Logprobs
 from tqdm import tqdm
 
@@ -73,21 +73,18 @@ def _sparse_logprobs_to_tensor(
     return logits
 
 
-def _fetch_fireworks_logprobs(
+async def _fetch_fireworks_logprobs(
     prompt_token_ids: list[int],
     gen_ids: list[int],
-    client: OpenAI,
+    client: AsyncOpenAI,
     model: str,
-    tokenizer,
     topk_logprobs: int,
 ) -> Logprobs | None:
-    """Fetch logprobs from Fireworks API (blocking call for use with ThreadPoolExecutor)."""
-    prompt_text = tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
-    output_text = tokenizer.decode(gen_ids, skip_special_tokens=False)
-
-    response = client.completions.create(
+    """Fetch logprobs from Fireworks API."""
+    # Pass token IDs directly to avoid tokenization mismatches
+    response = await client.completions.create(
         model=model,
-        prompt=prompt_text + output_text,
+        prompt=prompt_token_ids + gen_ids,
         max_tokens=1,
         logprobs=topk_logprobs,
         echo=True,
@@ -163,38 +160,32 @@ def _fireworks_to_sparse_logprobs(
     return result
 
 
-def _iter_fireworks_logprobs(
+async def _fetch_all_fireworks_logprobs(
     request_data: list[tuple[int, list[int], list[int]]],
-    client: OpenAI,
+    client: AsyncOpenAI,
     model: str,
     tokenizer,
     topk_logprobs: int,
     verbose: bool,
-) -> Iterator[SparseLogprobs]:
-    """Submit Fireworks requests and yield SparseLogprobs as results complete."""
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = []
-        for i, prompt_token_ids, gen_ids in request_data:
-            future = executor.submit(
-                _fetch_fireworks_logprobs,
+    concurrency: int = 10,
+) -> list[SparseLogprobs]:
+    """Fetch all Fireworks logprobs concurrently and return as list."""
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def fetch_one(i: int, prompt_token_ids: list[int], gen_ids: list[int]) -> SparseLogprobs:
+        async with semaphore:
+            logprobs_data = await _fetch_fireworks_logprobs(
                 prompt_token_ids=prompt_token_ids,
                 gen_ids=gen_ids,
                 client=client,
                 model=model,
-                tokenizer=tokenizer,
                 topk_logprobs=topk_logprobs,
             )
-            futures.append((i, prompt_token_ids, gen_ids, future))
-
-        # Yield results with progress bar
-        iterator = tqdm(futures, desc="Verifying via fireworks API") if verbose else futures
-        for i, prompt_token_ids, gen_ids, future in iterator:
-            logprobs_data = future.result()
             prompt_len = len(prompt_token_ids)
             gen_len = len(gen_ids)
 
-            # +1 for the empty token Fireworks prepends
-            start_idx = prompt_len + 1
+            # When using token IDs directly, Fireworks doesn't prepend an extra BOS
+            start_idx = prompt_len
 
             sparse_logprobs = _fireworks_to_sparse_logprobs(
                 logprobs_data.top_logprobs,
@@ -202,7 +193,17 @@ def _iter_fireworks_logprobs(
                 n_tokens=gen_len,
                 tokenizer=tokenizer,
             )
-            yield SparseLogprobs(index=i, gen_ids=gen_ids, logprobs=sparse_logprobs)
+            return SparseLogprobs(index=i, gen_ids=gen_ids, logprobs=sparse_logprobs)
+
+    tasks = [fetch_one(i, prompt_token_ids, gen_ids) for i, prompt_token_ids, gen_ids in request_data]
+
+    if verbose:
+        results = []
+        for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Verifying via fireworks API"):
+            results.append(await coro)
+        return results
+    else:
+        return await asyncio.gather(*tasks)
 
 
 def _compute_verification_metrics_from_logprobs(
@@ -265,93 +266,35 @@ def _compute_verification_metrics_from_logprobs(
     return seq_token_metrics
 
 
-@torch.inference_mode()
-def verify_outputs_api(
-    outputs: list[TokenSequence],
-    backend: Literal["tinker", "fireworks"],
+def _process_results_to_metrics(
+    results: list[SparseLogprobs],
+    n_outputs: int,
     vocab_size: int,
-    *,
     temperature: float,
     top_k: int,
     top_p: float,
     seed: int,
-    # Backend-specific args
-    sampling_client=None,  # For Tinker
-    client: OpenAI | None = None,  # For Fireworks
-    model: str | None = None,  # For Fireworks
-    tokenizer=None,  # For Fireworks
-    topk_logprobs: int = 20,
-    verbose: bool = True,
+    verbose: bool,
 ) -> list[list[TokenMetrics]]:
-    """
-    Verify LLM outputs using API-based verification.
-
-    This function takes token sequences (prompt + generated output) and verifies
-    whether the outputs could have been produced by the specified model using
-    the given sampling parameters. Requests are submitted in parallel for efficiency.
+    """Shared logic: convert SparseLogprobs to TokenMetrics.
 
     Args:
-        outputs: List of TokenSequence objects containing prompt and output token IDs.
-        backend: Which backend to use ("tinker" or "fireworks").
-        vocab_size: The vocabulary size of the model.
-        temperature: Sampling temperature used during generation. Required.
-        top_k: Top-k sampling parameter. Required.
-        top_p: Top-p (nucleus) sampling parameter. Required.
-        seed: Random seed used during generation. Required.
-        sampling_client: A Tinker SamplingClient (required for backend="tinker").
-        client: An OpenAI client configured for Fireworks (required for backend="fireworks").
-        model: The model name for Fireworks (required for backend="fireworks").
-        tokenizer: HuggingFace tokenizer (required for backend="fireworks").
-        topk_logprobs: Number of top logprobs to request. Default: 20.
-        verbose: Whether to show progress and print a summary. Default: True.
+        results: List of SparseLogprobs from either backend.
+        n_outputs: Number of output sequences (for pre-allocating results).
+        vocab_size: Vocabulary size for dense tensor conversion.
+        temperature: Sampling temperature used during generation.
+        top_k: Top-k sampling parameter.
+        top_p: Top-p (nucleus) sampling parameter.
+        seed: Random seed used during generation.
+        verbose: Whether to print a summary.
 
     Returns:
         List of lists of TokenMetrics, one per token in each output sequence.
     """
     device = torch.device("cpu")
+    all_token_metrics: list[list[TokenMetrics]] = [[] for _ in range(n_outputs)]
 
-    all_token_metrics: list[list[TokenMetrics]] = [[] for _ in outputs]
-
-    # Prepare request data
-    request_data: list[tuple[int, list[int], list[int]]] = []  # (index, prompt_token_ids, gen_ids)
-    for i, req in enumerate(outputs):
-        prompt_token_ids: list[int] = _as_list(req.prompt_token_ids)
-        gen_ids: list[int] = _as_list(req.output_token_ids)
-        if len(gen_ids) == 0:
-            continue
-        request_data.append((i, prompt_token_ids, gen_ids))
-
-    if len(request_data) == 0:
-        return all_token_metrics
-
-    # Get logprobs iterator based on backend
-    # Both iterators yield SparseLogprobs - compact representation of top-k logprobs
-    if backend == "tinker":
-        if sampling_client is None:
-            raise ValueError("sampling_client is required for tinker backend")
-        logprobs_iter = _iter_tinker_logprobs(
-            request_data=request_data,
-            sampling_client=sampling_client,
-            topk_logprobs=topk_logprobs,
-            verbose=verbose,
-        )
-    elif backend == "fireworks":
-        if client is None or model is None or tokenizer is None:
-            raise ValueError("client, model, and tokenizer are required for fireworks backend")
-        logprobs_iter = _iter_fireworks_logprobs(
-            request_data=request_data,
-            client=client,
-            model=model,
-            tokenizer=tokenizer,
-            topk_logprobs=topk_logprobs,
-            verbose=verbose,
-        )
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
-
-    # Process all results with unified loop
-    # Materialize tensor only when needed to minimize memory usage
-    for result in logprobs_iter:
+    for result in results:
         logprobs_JV = _sparse_logprobs_to_tensor(
             sparse_logprobs=result.logprobs,
             n_tokens=len(result.gen_ids),
@@ -378,3 +321,152 @@ def verify_outputs_api(
         print(f"  Average margin: {summary['avg_margin']:.4f} ({summary['infinite_margin_rate']:.2%} infinite)")
 
     return all_token_metrics
+
+
+def _prepare_request_data(
+    outputs: list[TokenSequence],
+) -> tuple[list[tuple[int, list[int], list[int]]], int]:
+    """Prepare request data from outputs.
+
+    Returns:
+        Tuple of (request_data, n_outputs) where request_data is a list of
+        (index, prompt_token_ids, gen_ids) tuples.
+    """
+    request_data: list[tuple[int, list[int], list[int]]] = []
+    for i, req in enumerate(outputs):
+        prompt_token_ids: list[int] = _as_list(req.prompt_token_ids)
+        gen_ids: list[int] = _as_list(req.output_token_ids)
+        if len(gen_ids) == 0:
+            continue
+        request_data.append((i, prompt_token_ids, gen_ids))
+    return request_data, len(outputs)
+
+
+@torch.inference_mode()
+def verify_outputs_tinker(
+    outputs: list[TokenSequence],
+    vocab_size: int,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    seed: int,
+    sampling_client,
+    topk_logprobs: int = 20,
+    verbose: bool = True,
+) -> list[list[TokenMetrics]]:
+    """
+    Verify LLM outputs using Tinker API (synchronous).
+
+    This function takes token sequences (prompt + generated output) and verifies
+    whether the outputs could have been produced by the specified model using
+    the given sampling parameters.
+
+    Args:
+        outputs: List of TokenSequence objects containing prompt and output token IDs.
+        vocab_size: The vocabulary size of the model.
+        temperature: Sampling temperature used during generation.
+        top_k: Top-k sampling parameter.
+        top_p: Top-p (nucleus) sampling parameter.
+        seed: Random seed used during generation.
+        sampling_client: A Tinker SamplingClient.
+        topk_logprobs: Number of top logprobs to request. Default: 20.
+        verbose: Whether to show progress and print a summary. Default: True.
+
+    Returns:
+        List of lists of TokenMetrics, one per token in each output sequence.
+    """
+    request_data, n_outputs = _prepare_request_data(outputs)
+
+    if len(request_data) == 0:
+        return [[] for _ in outputs]
+
+    results = list(
+        _iter_tinker_logprobs(
+            request_data=request_data,
+            sampling_client=sampling_client,
+            topk_logprobs=topk_logprobs,
+            verbose=verbose,
+        )
+    )
+
+    return _process_results_to_metrics(
+        results=results,
+        n_outputs=n_outputs,
+        vocab_size=vocab_size,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        seed=seed,
+        verbose=verbose,
+    )
+
+
+@torch.inference_mode()
+async def verify_outputs_fireworks(
+    outputs: list[TokenSequence],
+    vocab_size: int,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    seed: int,
+    client: AsyncOpenAI,
+    model: str,
+    tokenizer,
+    topk_logprobs: int = 20,
+    verbose: bool = True,
+    concurrency: int = 10,
+) -> list[list[TokenMetrics]]:
+    """
+    Verify LLM outputs using Fireworks API (async).
+
+    This function takes token sequences (prompt + generated output) and verifies
+    whether the outputs could have been produced by the specified model using
+    the given sampling parameters. Requests are submitted concurrently.
+
+    In scripts, use: asyncio.run(verify_outputs_fireworks(...))
+    In Jupyter/async contexts, use: await verify_outputs_fireworks(...)
+
+    Args:
+        outputs: List of TokenSequence objects containing prompt and output token IDs.
+        vocab_size: The vocabulary size of the model.
+        temperature: Sampling temperature used during generation.
+        top_k: Top-k sampling parameter.
+        top_p: Top-p (nucleus) sampling parameter.
+        seed: Random seed used during generation.
+        client: An AsyncOpenAI client configured for Fireworks.
+        model: The Fireworks model name.
+        tokenizer: HuggingFace tokenizer for the model.
+        topk_logprobs: Number of top logprobs to request. Default: 20.
+        verbose: Whether to show progress and print a summary. Default: True.
+        concurrency: Maximum number of concurrent requests. Default: 10.
+
+    Returns:
+        List of lists of TokenMetrics, one per token in each output sequence.
+    """
+    request_data, n_outputs = _prepare_request_data(outputs)
+
+    if len(request_data) == 0:
+        return [[] for _ in outputs]
+
+    results = await _fetch_all_fireworks_logprobs(
+        request_data=request_data,
+        client=client,
+        model=model,
+        tokenizer=tokenizer,
+        topk_logprobs=topk_logprobs,
+        verbose=verbose,
+        concurrency=concurrency,
+    )
+
+    return _process_results_to_metrics(
+        results=results,
+        n_outputs=n_outputs,
+        vocab_size=vocab_size,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        seed=seed,
+        verbose=verbose,
+    )

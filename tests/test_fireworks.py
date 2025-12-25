@@ -6,11 +6,13 @@ from dataclasses import dataclass
 
 import openai
 import pytest
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
+from tqdm.asyncio import tqdm as atqdm
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from token_difr import TokenSequence, compute_metrics_summary, encode_thinking_response, verify_outputs_api
+from token_difr import TokenSequence, compute_metrics_summary, encode_thinking_response, verify_outputs_fireworks
+from token_difr.openrouter_api import openrouter_request
 
 # Load .env file if present
 try:
@@ -50,14 +52,15 @@ def get_fireworks_api_key():
     return api_key
 
 
-def generate_outputs_fireworks(
-    client: OpenAI,
+async def generate_outputs_fireworks(
+    client: AsyncOpenAI,
     tokenizer,
     prompts: list[str],
     temperature: float,
     max_tokens: int = 100,
     model: str = FIREWORKS_MODEL,
     verbose: bool = True,
+    concurrency: int = 10,
 ) -> tuple[list[TokenSequence], int]:
     """Generate outputs using Fireworks API for testing.
 
@@ -66,31 +69,43 @@ def generate_outputs_fireworks(
         and vocab_size is derived from the tokenizer.
     """
     vocab_size = len(tokenizer)
+    semaphore = asyncio.Semaphore(concurrency)
 
-    outputs = []
-    iterator = tqdm(prompts, desc="Generating via Fireworks") if verbose else prompts
-    for prompt in iterator:
-        messages = [{"role": "user", "content": prompt}]
-        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        prompt_token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+    async def generate_one(prompt: str) -> TokenSequence:
+        async with semaphore:
+            messages = [{"role": "user", "content": prompt}]
+            rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompt_token_ids = tokenizer.encode(rendered, add_special_tokens=False)
 
-        # Generate using Fireworks completions API
-        response = client.completions.create(
-            model=model,
-            prompt=rendered,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+            # Generate using Fireworks completions API with token IDs
+            # Use echo=True and logprobs to get actual token IDs back
+            response = await client.completions.create(
+                model=model,
+                prompt=prompt_token_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                echo=True,
+                logprobs=True,
+                extra_body={"echo": True, "top_logprobs": 1},
+            )
 
-        generated_text = response.choices[0].text
-        generated_token_ids = tokenizer.encode(generated_text, add_special_tokens=False)
+            generated_tokens = response.choices[0].logprobs.content[len(prompt_token_ids) :]
+            generated_token_ids = [content["token_id"] for content in generated_tokens]
 
-        outputs.append(
-            TokenSequence(
+            return TokenSequence(
                 prompt_token_ids=prompt_token_ids,
                 output_token_ids=generated_token_ids,
             )
-        )
+
+    # Run all generations concurrently
+    tasks = [generate_one(prompt) for prompt in prompts]
+
+    if verbose:
+        outputs = []
+        for coro in atqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Generating via Fireworks"):
+            outputs.append(await coro)
+    else:
+        outputs = await asyncio.gather(*tasks)
 
     return outputs, vocab_size
 
@@ -106,8 +121,8 @@ def test_verify_outputs_fireworks(temperature):
     max_tokens = 100
     min_match_rate = 0.98
 
-    # Create Fireworks client
-    client = OpenAI(
+    # Create Fireworks async client (for generation)
+    client = AsyncOpenAI(
         api_key=api_key,
         base_url="https://api.fireworks.ai/inference/v1",
     )
@@ -116,22 +131,21 @@ def test_verify_outputs_fireworks(temperature):
     tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME, trust_remote_code=True)
     vocab_size = len(tokenizer)
 
-    # Generate outputs
-    outputs, vocab_size = generate_outputs_fireworks(
+    # Generate outputs (async, run with asyncio.run)
+    outputs, vocab_size = asyncio.run(generate_outputs_fireworks(
         client=client,
         tokenizer=tokenizer,
         prompts=TEST_PROMPTS,
         temperature=1e-8,  # Near-greedy for generation
         max_tokens=max_tokens,
-    )
+    ))
 
     total_tokens = sum(len(o.output_token_ids) for o in outputs)
     assert total_tokens > 0, "Should generate at least some tokens"
 
-    # Verify outputs using Fireworks backend
-    results = verify_outputs_api(
+    # Verify outputs using Fireworks backend (async)
+    results = asyncio.run(verify_outputs_fireworks(
         outputs,
-        backend="fireworks",
         vocab_size=vocab_size,
         temperature=temperature,
         top_k=top_k,
@@ -141,7 +155,7 @@ def test_verify_outputs_fireworks(temperature):
         model=FIREWORKS_MODEL,
         tokenizer=tokenizer,
         topk_logprobs=5,
-    )
+    ))
 
     # Check results structure
     assert len(results) == len(outputs), "Should have results for each output sequence"
@@ -203,84 +217,38 @@ def get_openrouter_api_key() -> str:
     return api_key
 
 
-async def openrouter_request(
-    client: openai.AsyncOpenAI,
-    model: str,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-    temperature: float,
-    provider: str,
-) -> tuple[str, str]:
-    """Make a single OpenRouter request.
-
-    Returns:
-        Tuple of (content, reasoning) where reasoning may be empty for non-thinking models.
-    """
-    completion = await client.chat.completions.create(
-        model=model,
-        messages=messages,  # type: ignore[arg-type]
-        max_tokens=max_tokens,
-        temperature=temperature,
-        extra_body={
-            "provider": {"order": [provider]},
-        },
-    )
-    content = completion.choices[0].message.content or ""
-    reasoning = getattr(completion.choices[0].message, "reasoning", None) or ""
-    return content, reasoning
-
-
 async def generate_outputs_openrouter(
-    openrouter_client: openai.AsyncOpenAI,
+    client: openai.AsyncOpenAI,
     tokenizer,
     prompts: list[str],
-    openrouter_model: str,
+    model: str,
     provider: str,
     temperature: float = 0.0,
     max_tokens: int = 100,
     concurrency: int = 8,
-    verbose: bool = True,
 ) -> tuple[list[TokenSequence], int]:
     """Generate outputs using OpenRouter API.
 
-    Args:
-        openrouter_client: OpenRouter AsyncOpenAI client.
-        tokenizer: HuggingFace tokenizer.
-        prompts: List of prompts.
-        openrouter_model: Model name on OpenRouter.
-        provider: OpenRouter provider (e.g., "Fireworks").
-        temperature: Sampling temperature.
-        max_tokens: Max tokens to generate.
-        concurrency: Max concurrent requests.
-        verbose: Show progress bar.
+    Uses openrouter_request from token_difr.openrouter_api.
 
     Returns:
         Tuple of (outputs, vocab_size).
     """
     vocab_size = len(tokenizer)
     semaphore = asyncio.Semaphore(concurrency)
-
-    # Build conversations
     conversations = [[{"role": "user", "content": p}] for p in prompts]
 
     async def _wrapped(idx: int, messages: list[dict[str, str]]) -> tuple[int, str, str]:
         async with semaphore:
-            content, reasoning = await openrouter_request(
-                openrouter_client, openrouter_model, messages, max_tokens, temperature, provider
-            )
+            content, reasoning = await openrouter_request(client, model, messages, max_tokens, temperature, provider)
             return idx, content, reasoning
 
     tasks = [asyncio.create_task(_wrapped(i, conv)) for i, conv in enumerate(conversations)]
     results: list[tuple[str, str]] = [("", "")] * len(conversations)
 
-    if verbose:
-        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"OpenRouter ({provider})"):
-            idx, content, reasoning = await fut
-            results[idx] = (content, reasoning)
-    else:
-        for fut in asyncio.as_completed(tasks):
-            idx, content, reasoning = await fut
-            results[idx] = (content, reasoning)
+    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"OpenRouter ({provider})"):
+        idx, content, reasoning = await fut
+        results[idx] = (content, reasoning)
 
     # Convert to TokenSequence
     outputs = []
@@ -288,19 +256,12 @@ async def generate_outputs_openrouter(
         rendered = tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
         prompt_token_ids = tokenizer.encode(rendered, add_special_tokens=False)
         response_token_ids = encode_thinking_response(content, reasoning, tokenizer, max_tokens)
-
-        outputs.append(
-            TokenSequence(
-                prompt_token_ids=prompt_token_ids,
-                output_token_ids=response_token_ids,
-            )
-        )
+        outputs.append(TokenSequence(prompt_token_ids=prompt_token_ids, output_token_ids=response_token_ids))
 
     return outputs, vocab_size
 
 
-@pytest.mark.asyncio
-async def test_verify_openrouter_generation_with_fireworks():
+def test_verify_openrouter_generation_with_fireworks():
     """Test: Generate via OpenRouter (Fireworks provider), verify via Fireworks API."""
     fireworks_api_key = get_fireworks_api_key()
     openrouter_api_key = get_openrouter_api_key()
@@ -312,7 +273,7 @@ async def test_verify_openrouter_generation_with_fireworks():
     min_match_rate = 0.98
 
     # Create clients
-    fireworks_client = OpenAI(
+    fireworks_client = AsyncOpenAI(
         api_key=fireworks_api_key,
         base_url="https://api.fireworks.ai/inference/v1",
     )
@@ -326,23 +287,22 @@ async def test_verify_openrouter_generation_with_fireworks():
     vocab_size = len(tokenizer)
 
     # Generate via OpenRouter with Fireworks as provider
-    outputs, vocab_size = await generate_outputs_openrouter(
-        openrouter_client=openrouter_client,
+    outputs, vocab_size = asyncio.run(generate_outputs_openrouter(
+        client=openrouter_client,
         tokenizer=tokenizer,
         prompts=TEST_PROMPTS,
-        openrouter_model=OPENROUTER_LLAMA_MODEL,
+        model=OPENROUTER_LLAMA_MODEL,
         provider="Fireworks",
         temperature=0.0,
         max_tokens=max_tokens,
-    )
+    ))
 
     total_tokens = sum(len(o.output_token_ids) for o in outputs)
     assert total_tokens > 0, "Should generate at least some tokens"
 
-    # Verify via Fireworks
-    results = verify_outputs_api(
+    # Verify via Fireworks (async)
+    results = asyncio.run(verify_outputs_fireworks(
         outputs,
-        backend="fireworks",
         vocab_size=vocab_size,
         temperature=0.0,
         top_k=top_k,
@@ -352,7 +312,7 @@ async def test_verify_openrouter_generation_with_fireworks():
         model=FIREWORKS_MODEL,
         tokenizer=tokenizer,
         topk_logprobs=5,
-    )
+    ))
 
     summary = compute_metrics_summary(results)
     print(f"\nOpenRouter->Fireworks: exact match rate = {summary['exact_match_rate']:.2%}")
