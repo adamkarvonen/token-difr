@@ -251,11 +251,6 @@ def verify_outputs(
     gc.collect()
 
     if verbose:
-        summary = compute_metrics_summary(all_token_metrics)
-        print("Verification Summary:")
-        print(f"  Total tokens: {summary['total_tokens']}")
-        print(f"  Exact match rate: {summary['exact_match_rate']:.2%}")
-        print(f"  Average probability: {summary['avg_prob']:.4f}")
-        print(f"  Average margin: {summary['avg_margin']:.4f} ({summary['infinite_margin_rate']:.2%} infinite)")
+        compute_metrics_summary(all_token_metrics, verbose=True)
 
     return all_token_metrics

@@ -21,15 +21,17 @@ except ImportError:
     pass
 
 # Model configurations keyed by HuggingFace model name
-# Each entry: {hf_model: (fireworks_model, openrouter_model)}
+# Each entry: {hf_model: (fireworks_model, openrouter_model, openrouter_provider)}
 MODEL_CONFIGS = {
     "meta-llama/Llama-3.3-70B-Instruct": (
         "accounts/fireworks/models/llama-v3p3-70b-instruct",
         "meta-llama/llama-3.3-70b-instruct",
+        "groq",
     ),
     "moonshotai/Kimi-K2-Thinking": (
         "accounts/fireworks/models/kimi-k2-thinking",
         "moonshotai/kimi-k2-thinking",
+        "moonshotai",
     ),
 }
 
@@ -121,7 +123,7 @@ async def generate_outputs_fireworks(
 def test_verify_outputs_fireworks(hf_model):
     """Test Fireworks verification achieves >= 98% exact match and all metrics/summary fields are valid."""
     api_key = get_fireworks_api_key()
-    fireworks_model, _ = MODEL_CONFIGS[hf_model]
+    fireworks_model, _, _ = MODEL_CONFIGS[hf_model]
     model_name = hf_model.split("/")[-1]
 
     top_k = 5  # Fireworks default
@@ -147,7 +149,7 @@ def test_verify_outputs_fireworks(hf_model):
             client=client,
             tokenizer=tokenizer,
             prompts=TEST_PROMPTS,
-            temperature=0,
+            temperature=temperature,
             max_tokens=max_tokens,
             model=fireworks_model,
         )
@@ -239,7 +241,7 @@ def test_verify_openrouter_generation_with_fireworks(hf_model):
     """Test: Generate via OpenRouter, verify via Fireworks API."""
     fireworks_api_key = get_fireworks_api_key()
     openrouter_api_key = get_openrouter_api_key()
-    fireworks_model, openrouter_model = MODEL_CONFIGS[hf_model]
+    fireworks_model, openrouter_model, openrouter_provider = MODEL_CONFIGS[hf_model]
     model_name = hf_model.split("/")[-1]
 
     temperature = 0.0
@@ -268,13 +270,13 @@ def test_verify_openrouter_generation_with_fireworks(hf_model):
         messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
         conversations.append(messages)
 
-    # Generate via OpenRouter with Fireworks as provider
+    # Generate via OpenRouter with model-specific provider
     responses = asyncio.run(
         generate_openrouter_responses(
             client=openrouter_client,
             conversations=conversations,
             model=openrouter_model,
-            provider="fireworks",
+            provider=openrouter_provider,
             temperature=temperature,
             max_tokens=max_tokens,
             seed=seed,

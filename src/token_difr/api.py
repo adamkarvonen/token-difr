@@ -11,7 +11,6 @@ from tqdm import tqdm
 from token_difr.common import (
     TokenMetrics,
     TokenSequence,
-    _as_list,
     compute_metrics_summary,
 )
 
@@ -95,7 +94,7 @@ async def _fetch_fireworks_logprobs(
 
 
 def _iter_tinker_logprobs(
-    request_data: list[tuple[int, list[int], list[int]]],
+    outputs: list[TokenSequence],
     sampling_client,
     topk_logprobs: int,
     verbose: bool,
@@ -105,8 +104,10 @@ def _iter_tinker_logprobs(
 
     # Submit all requests (they return futures)
     futures = []
-    for i, prompt_token_ids, gen_ids in request_data:
-        full_sequence = prompt_token_ids + gen_ids
+    for i, req in enumerate(outputs):
+        if len(req.output_token_ids) == 0:
+            continue
+        full_sequence = list(req.prompt_token_ids) + list(req.output_token_ids)
         full_prompt = tinker.ModelInput.from_ints(full_sequence)
 
         future = sampling_client.sample(
@@ -116,18 +117,18 @@ def _iter_tinker_logprobs(
             include_prompt_logprobs=True,
             topk_prompt_logprobs=topk_logprobs,
         )
-        futures.append((i, prompt_token_ids, gen_ids, future))
+        futures.append((i, req, future))
 
     # Yield results with progress bar
     iterator = tqdm(futures, desc="Verifying via tinker API") if verbose else futures
-    for i, prompt_token_ids, gen_ids, future in iterator:
+    for i, req, future in iterator:
         logprob_result = future.result()
-        prompt_len = len(prompt_token_ids)
-        gen_len = len(gen_ids)
+        prompt_len = len(req.prompt_token_ids)
+        gen_len = len(req.output_token_ids)
 
         # Extract just the slice we need (still sparse, no tensor conversion)
         sparse_logprobs = logprob_result.topk_prompt_logprobs[prompt_len : prompt_len + gen_len]
-        yield SparseLogprobs(index=i, gen_ids=gen_ids, logprobs=sparse_logprobs)
+        yield SparseLogprobs(index=i, gen_ids=list(req.output_token_ids), logprobs=sparse_logprobs)
 
 
 def _fireworks_to_sparse_logprobs(
@@ -163,7 +164,7 @@ def _fireworks_to_sparse_logprobs(
 
 
 async def _fetch_all_fireworks_logprobs(
-    request_data: list[tuple[int, list[int], list[int]]],
+    outputs: list[TokenSequence],
     client: AsyncOpenAI,
     model: str,
     topk_logprobs: int,
@@ -173,8 +174,10 @@ async def _fetch_all_fireworks_logprobs(
     """Fetch all Fireworks logprobs concurrently and return as list."""
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def fetch_one(i: int, prompt_token_ids: list[int], gen_ids: list[int]) -> SparseLogprobs:
+    async def fetch_one(i: int, req: TokenSequence) -> SparseLogprobs:
         async with semaphore:
+            prompt_token_ids = list(req.prompt_token_ids)
+            gen_ids = list(req.output_token_ids)
             content = await _fetch_fireworks_logprobs(
                 prompt_token_ids=prompt_token_ids,
                 gen_ids=gen_ids,
@@ -190,7 +193,7 @@ async def _fetch_all_fireworks_logprobs(
             )
             return SparseLogprobs(index=i, gen_ids=gen_ids, logprobs=sparse_logprobs)
 
-    tasks = [fetch_one(i, prompt_token_ids, gen_ids) for i, prompt_token_ids, gen_ids in request_data]
+    tasks = [fetch_one(i, req) for i, req in enumerate(outputs) if len(req.output_token_ids) > 0]
 
     if verbose:
         results = []
@@ -308,33 +311,9 @@ def _process_results_to_metrics(
         all_token_metrics[result.index] = seq_token_metrics
 
     if verbose:
-        summary = compute_metrics_summary(all_token_metrics)
-        print("Verification Summary:")
-        print(f"  Total tokens: {summary['total_tokens']}")
-        print(f"  Exact match rate: {summary['exact_match_rate']:.2%}")
-        print(f"  Average probability: {summary['avg_prob']:.4f}")
-        print(f"  Average margin: {summary['avg_margin']:.4f} ({summary['infinite_margin_rate']:.2%} infinite)")
+        compute_metrics_summary(all_token_metrics, verbose=True)
 
     return all_token_metrics
-
-
-def _prepare_request_data(
-    outputs: list[TokenSequence],
-) -> tuple[list[tuple[int, list[int], list[int]]], int]:
-    """Prepare request data from outputs.
-
-    Returns:
-        Tuple of (request_data, n_outputs) where request_data is a list of
-        (index, prompt_token_ids, gen_ids) tuples.
-    """
-    request_data: list[tuple[int, list[int], list[int]]] = []
-    for i, req in enumerate(outputs):
-        prompt_token_ids: list[int] = _as_list(req.prompt_token_ids)
-        gen_ids: list[int] = _as_list(req.output_token_ids)
-        if len(gen_ids) == 0:
-            continue
-        request_data.append((i, prompt_token_ids, gen_ids))
-    return request_data, len(outputs)
 
 
 @torch.inference_mode()
@@ -371,14 +350,14 @@ def verify_outputs_tinker(
     Returns:
         List of lists of TokenMetrics, one per token in each output sequence.
     """
-    request_data, n_outputs = _prepare_request_data(outputs)
-
-    if len(request_data) == 0:
+    # Check if any outputs have tokens to verify
+    has_tokens = any(len(req.output_token_ids) > 0 for req in outputs)
+    if not has_tokens:
         return [[] for _ in outputs]
 
     results = list(
         _iter_tinker_logprobs(
-            request_data=request_data,
+            outputs=outputs,
             sampling_client=sampling_client,
             topk_logprobs=topk_logprobs,
             verbose=verbose,
@@ -387,7 +366,7 @@ def verify_outputs_tinker(
 
     return _process_results_to_metrics(
         results=results,
-        n_outputs=n_outputs,
+        n_outputs=len(outputs),
         vocab_size=vocab_size,
         temperature=temperature,
         top_k=top_k,
@@ -438,13 +417,13 @@ async def verify_outputs_fireworks(
     Returns:
         List of lists of TokenMetrics, one per token in each output sequence.
     """
-    request_data, n_outputs = _prepare_request_data(outputs)
-
-    if len(request_data) == 0:
+    # Check if any outputs have tokens to verify
+    has_tokens = any(len(req.output_token_ids) > 0 for req in outputs)
+    if not has_tokens:
         return [[] for _ in outputs]
 
     results = await _fetch_all_fireworks_logprobs(
-        request_data=request_data,
+        outputs=outputs,
         client=client,
         model=model,
         topk_logprobs=topk_logprobs,
@@ -454,7 +433,7 @@ async def verify_outputs_fireworks(
 
     return _process_results_to_metrics(
         results=results,
-        n_outputs=n_outputs,
+        n_outputs=len(outputs),
         vocab_size=vocab_size,
         temperature=temperature,
         top_k=top_k,

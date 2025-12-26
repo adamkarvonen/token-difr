@@ -90,12 +90,6 @@ def tokenize_openrouter_responses(
         content = message.content or ""
         # reasoning is an OpenRouter extension - check both direct attribute and model_extra
         reasoning = getattr(message, "reasoning", None)
-        if reasoning is None and hasattr(message, "model_extra"):
-            reasoning = message.model_extra.get("reasoning")
-        if reasoning is None:
-            # Also try accessing from the raw response dict if available
-            raw = getattr(message, "__dict__", {})
-            reasoning = raw.get("reasoning")
         reasoning = reasoning or ""
 
         # Tokenize prompt

@@ -348,12 +348,13 @@ def _verify_vllm_gumbel_max(
     return pred_ids_J, gumbel_ranks_J, margins_J
 
 
-def compute_metrics_summary(results: list[list[TokenMetrics]]) -> dict[str, Any]:
+def compute_metrics_summary(results: list[list[TokenMetrics]], verbose: bool = False) -> dict[str, Any]:
     """
     Compute aggregate statistics from verification results.
 
     Args:
         results: Output from verify_outputs().
+        verbose: If True, print a summary of the metrics.
 
     Returns:
         Dictionary with keys:
@@ -399,7 +400,7 @@ def compute_metrics_summary(results: list[list[TokenMetrics]]) -> dict[str, Any]
     infinite_margin_count = total_tokens - finite_margin_count
     avg_margin = total_margin / finite_margin_count if finite_margin_count > 0 else float("inf")
 
-    return {
+    summary = {
         "total_tokens": total_tokens,
         "exact_match_rate": total_matches / total_tokens,
         "avg_prob": total_prob / total_tokens,
@@ -408,3 +409,12 @@ def compute_metrics_summary(results: list[list[TokenMetrics]]) -> dict[str, Any]
         "avg_logit_rank": total_logit_rank / total_tokens,
         "avg_gumbel_rank": total_gumbel_rank / total_tokens,
     }
+
+    if verbose:
+        print("Verification Summary:")
+        print(f"  Total tokens: {summary['total_tokens']}")
+        print(f"  Exact match rate: {summary['exact_match_rate']:.2%}")
+        print(f"  Average probability: {summary['avg_prob']:.4f}")
+        print(f"  Average margin: {summary['avg_margin']:.4f} ({summary['infinite_margin_rate']:.2%} infinite)")
+
+    return summary
