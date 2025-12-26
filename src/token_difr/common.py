@@ -52,6 +52,7 @@ def construct_prompts(
     tokenizer=None,
     model_name: str | None = None,
     custom_prompts: list[list[dict[str, str]]] | None = None,
+    system_prompt: str | None = "You are a helpful assistant.",
 ) -> list[list[dict[str, str]]]:
     """Construct a dataset of conversation prompts for testing.
 
@@ -66,13 +67,18 @@ def construct_prompts(
         model_name: Model name to load tokenizer from if tokenizer is None.
         custom_prompts: Optional list of custom prompts to use instead of loading
             from the dataset. If provided, other parameters are ignored.
+        system_prompt: System prompt to prepend to each conversation. Defaults to
+            "You are a helpful assistant." Set to None to skip adding a system prompt.
 
     Returns:
         List of conversation prompts, where each prompt is a list of message dicts
         with 'role' and 'content' keys.
     """
     if custom_prompts is not None:
-        return custom_prompts[:n_prompts]
+        prompts = custom_prompts[:n_prompts]
+        if system_prompt is not None:
+            prompts = [[{"role": "system", "content": system_prompt}] + p for p in prompts]
+        return prompts
 
     # Import here to avoid dependency issues if not using this function
     from datasets import load_dataset
@@ -118,6 +124,9 @@ def construct_prompts(
             if prompt_key not in unique_prompts:
                 unique_prompts.add(prompt_key)
                 conversation_prompts.append(conversation)
+
+    if system_prompt is not None:
+        conversation_prompts = [[{"role": "system", "content": system_prompt}] + c for c in conversation_prompts]
 
     return conversation_prompts
 

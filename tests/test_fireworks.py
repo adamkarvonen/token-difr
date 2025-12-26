@@ -9,7 +9,13 @@ from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm as atqdm
 from transformers import AutoTokenizer
 
-from token_difr import TokenSequence, compute_metrics_summary, verify_outputs_fireworks
+from token_difr import (
+    FIREWORKS_MODEL_REGISTRY,
+    TokenSequence,
+    compute_metrics_summary,
+    get_openrouter_name,
+    verify_outputs_fireworks,
+)
 from token_difr.openrouter_api import generate_openrouter_responses, tokenize_openrouter_responses
 
 # Load .env file if present
@@ -20,19 +26,11 @@ try:
 except ImportError:
     pass
 
-# Model configurations keyed by HuggingFace model name
-# Each entry: {hf_model: (fireworks_model, openrouter_model, openrouter_provider)}
-MODEL_CONFIGS = {
-    "meta-llama/Llama-3.3-70B-Instruct": (
-        "accounts/fireworks/models/llama-v3p3-70b-instruct",
-        "meta-llama/llama-3.3-70b-instruct",
-        "groq",
-    ),
-    "moonshotai/Kimi-K2-Thinking": (
-        "accounts/fireworks/models/kimi-k2-thinking",
-        "moonshotai/kimi-k2-thinking",
-        "moonshotai",
-    ),
+# Model configurations: HuggingFace model name -> OpenRouter provider
+# Fireworks and OpenRouter model names are looked up from registries
+MODEL_TO_PROVIDER = {
+    "meta-llama/Llama-3.3-70B-Instruct": "groq",
+    "moonshotai/Kimi-K2-Thinking": "moonshotai",
 }
 
 TEST_PROMPTS = [
@@ -117,13 +115,13 @@ async def generate_outputs_fireworks(
 
 @pytest.mark.parametrize(
     "hf_model",
-    list(MODEL_CONFIGS.keys()),
-    ids=[k.split("/")[-1] for k in MODEL_CONFIGS.keys()],
+    list(MODEL_TO_PROVIDER.keys()),
+    ids=[k.split("/")[-1] for k in MODEL_TO_PROVIDER.keys()],
 )
 def test_verify_outputs_fireworks(hf_model):
     """Test Fireworks verification achieves >= 98% exact match and all metrics/summary fields are valid."""
     api_key = get_fireworks_api_key()
-    fireworks_model, _, _ = MODEL_CONFIGS[hf_model]
+    fireworks_model = FIREWORKS_MODEL_REGISTRY[hf_model]
     model_name = hf_model.split("/")[-1]
 
     top_k = 50
@@ -235,14 +233,16 @@ def get_openrouter_api_key() -> str:
 
 @pytest.mark.parametrize(
     "hf_model",
-    list(MODEL_CONFIGS.keys()),
-    ids=[k.split("/")[-1] for k in MODEL_CONFIGS.keys()],
+    list(MODEL_TO_PROVIDER.keys()),
+    ids=[k.split("/")[-1] for k in MODEL_TO_PROVIDER.keys()],
 )
 def test_verify_openrouter_generation_with_fireworks(hf_model):
     """Test: Generate via OpenRouter, verify via Fireworks API."""
     fireworks_api_key = get_fireworks_api_key()
     openrouter_api_key = get_openrouter_api_key()
-    fireworks_model, openrouter_model, openrouter_provider = MODEL_CONFIGS[hf_model]
+    fireworks_model = FIREWORKS_MODEL_REGISTRY[hf_model]
+    openrouter_model = get_openrouter_name(hf_model)
+    openrouter_provider = MODEL_TO_PROVIDER[hf_model]
     model_name = hf_model.split("/")[-1]
 
     temperature = 0.0
