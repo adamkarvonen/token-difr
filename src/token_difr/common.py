@@ -115,6 +115,10 @@ def construct_prompts(
         if not conversation or conversation[-1].get("role") != "user":
             continue
 
+        # Skip conversations with empty messages
+        if any(not msg.get("content") or not msg["content"].strip() for msg in conversation):
+            continue
+
         # Tokenize to check length and uniqueness
         rendered = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
         token_ids = tokenizer.encode(rendered, add_special_tokens=False)
