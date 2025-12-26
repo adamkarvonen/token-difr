@@ -12,6 +12,8 @@ FIREWORKS_MODEL_REGISTRY: dict[str, str] = {
     "meta-llama/Llama-3.1-70B-Instruct": "accounts/fireworks/models/llama-v3p1-70b-instruct",
     # Kimi models
     "moonshotai/Kimi-K2-Thinking": "accounts/fireworks/models/kimi-k2-thinking",
+    # Note: Original kimi-k2-instruct not available on Fireworks, only 0905 version
+    "moonshotai/Kimi-K2-Instruct-0905": "accounts/fireworks/models/kimi-k2-instruct-0905",
     # Qwen models
     "Qwen/Qwen2.5-72B-Instruct": "accounts/fireworks/models/qwen2p5-72b-instruct",
     "Qwen/Qwen3-235B-A22B-Instruct-2507": "accounts/fireworks/models/qwen3-235b-a22b-instruct-2507",
@@ -20,6 +22,8 @@ FIREWORKS_MODEL_REGISTRY: dict[str, str] = {
 # HuggingFace name -> OpenRouter name (only for models that differ from hf_name.lower())
 OPENROUTER_MODEL_REGISTRY: dict[str, str] = {
     "Qwen/Qwen3-235B-A22B-Instruct-2507": "qwen/qwen3-235b-a22b-2507",
+    "moonshotai/Kimi-K2-Instruct": "moonshotai/kimi-k2",
+    "moonshotai/Kimi-K2-Instruct-0905": "moonshotai/kimi-k2-0905",
 }
 
 

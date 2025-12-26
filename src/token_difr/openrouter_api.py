@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import openai
@@ -40,7 +41,7 @@ async def generate_openrouter_responses(
         List of raw ChatCompletion objects in the same order as input conversations.
     """
     semaphore = asyncio.Semaphore(concurrency)
-    extra_body: dict = {"provider": {"order": [provider]}}
+    extra_body: dict = {"provider": {"only": [provider]}}
 
     async def _request(idx: int, messages: list[dict[str, str]]) -> tuple[int, ChatCompletion]:
         async with semaphore:
@@ -141,17 +142,18 @@ async def main():
     temperature = 0.0
     concurrency = 50
 
+    openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not openrouter_api_key:
+        raise ValueError("OPENROUTER_API_KEY environment variable not set")
+
     for provider in ["cerebras", "hyperbolic", "groq", "siliconflow/fp8", "deepinfra"]:
         save_dir = Path("openrouter_responses")
         n_samples = 2000
         max_ctx_len = 512
 
-        with open("openrouter_api_key.txt") as f:
-            api_key = f.read().strip()
-
         client = openai.AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
+            api_key=openrouter_api_key,
         )
 
         conversations = construct_prompts(n_prompts=n_samples, max_ctx_len=max_ctx_len, model_name=model_name)

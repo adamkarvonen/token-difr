@@ -28,13 +28,10 @@ class AuditResult:
     infinite_margin_rate: float
     total_tokens: int
     n_sequences: int
-    passed: bool
-    threshold: float
 
     def __repr__(self) -> str:
-        status = "PASSED" if self.passed else "FAILED"
         return (
-            f"AuditResult({status}: {self.exact_match_rate:.1%} match rate, "
+            f"AuditResult({self.exact_match_rate:.1%} match rate, "
             f"{self.total_tokens} tokens across {self.n_sequences} sequences)"
         )
 
@@ -45,7 +42,6 @@ async def _audit_provider_async(
     provider: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 100,
-    threshold: float = 0.97,
     seed: int = 42,
     top_k: int = 50,
     top_p: float = 0.95,
@@ -126,8 +122,6 @@ async def _audit_provider_async(
         infinite_margin_rate=summary["infinite_margin_rate"],
         total_tokens=summary["total_tokens"],
         n_sequences=len(sequences),
-        passed=summary["exact_match_rate"] >= threshold,
-        threshold=threshold,
     )
 
 
@@ -137,7 +131,6 @@ def audit_provider(
     provider: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 100,
-    threshold: float = 0.97,
     seed: int = 42,
     top_k: int = 50,
     top_p: float = 0.95,
@@ -149,7 +142,7 @@ def audit_provider(
     1. Generates responses via OpenRouter using the specified provider
     2. Tokenizes the responses using the model's tokenizer
     3. Verifies the token sequences against Fireworks logprobs
-    4. Returns an AuditResult with metrics and pass/fail status
+    4. Returns an AuditResult with verification metrics
 
     Args:
         conversations: List of conversations, where each conversation is a list of
@@ -161,14 +154,13 @@ def audit_provider(
             If None, OpenRouter will choose automatically.
         temperature: Sampling temperature. Use 0.0 for deterministic outputs.
         max_tokens: Maximum tokens to generate per response.
-        threshold: Minimum exact match rate to pass (default 0.97 = 97%).
         seed: Random seed for reproducibility.
         top_k: Top-k sampling parameter for verification.
         top_p: Top-p (nucleus) sampling parameter for verification.
         concurrency: Number of concurrent API requests.
 
     Returns:
-        AuditResult with verification metrics and pass/fail status.
+        AuditResult with verification metrics.
 
     Raises:
         ValueError: If API keys are not set or model is not in registry.
@@ -178,7 +170,7 @@ def audit_provider(
         >>> prompts = construct_prompts(n_prompts=50, model_name="meta-llama/Llama-3.3-70B-Instruct")
         >>> result = audit_provider(prompts, "meta-llama/Llama-3.3-70B-Instruct", provider="groq")
         >>> print(result)
-        AuditResult(PASSED: 98.3% match rate, 4521 tokens across 50 sequences)
+        AuditResult(98.3% match rate, 4521 tokens across 50 sequences)
     """
     return asyncio.run(
         _audit_provider_async(
@@ -187,7 +179,6 @@ def audit_provider(
             provider=provider,
             temperature=temperature,
             max_tokens=max_tokens,
-            threshold=threshold,
             seed=seed,
             top_k=top_k,
             top_p=top_p,
