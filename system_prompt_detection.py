@@ -1,8 +1,8 @@
 """Test detection of system prompt modifications via Gumbel-Max verification.
 
 Experiment:
-- Generate responses via OpenRouter/Groq with different system prompts
-- Verify via Tinker always using the BASE system prompt
+- Generate responses via OpenRouter with different system prompts
+- Verify via Fireworks always using the BASE system prompt
 - Measure how well we can detect when the system prompt has been modified
 """
 
@@ -20,137 +20,38 @@ except ImportError:
     pass
 
 import openai
-import tinker
+from openai import AsyncOpenAI
 from transformers import AutoTokenizer
-from tqdm import tqdm
 
-from token_difr import (
-    TokenSequence,
-    compute_metrics_summary,
-    construct_prompts,
-    encode_thinking_response,
-    verify_outputs_tinker,
-)
+from token_difr import TokenSequence, compute_metrics_summary, verify_outputs_fireworks
+from token_difr.openrouter_api import generate_openrouter_responses, tokenize_openrouter_responses
 
-# Model configuration
-MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-OPENROUTER_MODEL_NAME = "meta-llama/llama-3.1-8b-instruct"
-PROVIDER = "Groq"
+# Model configuration: (hf_model, fireworks_model, openrouter_model, openrouter_provider)
+HF_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+FIREWORKS_MODEL = "fireworks/llama-v3p3-70b-instruct"
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct"
+OPENROUTER_PROVIDER = "groq"
 
-MODEL_NAME = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-OPENROUTER_MODEL_NAME = "qwen/qwen3-235b-a22b-2507"
-PROVIDER = "together"
 
-# MODEL_NAME = "moonshotai/Kimi-K2-Thinking"
-# OPENROUTER_MODEL_NAME = "moonshotai/kimi-k2-thinking"
-# PROVIDER = "moonshotai"
+HF_MODEL = "moonshotai/Kimi-K2-Thinking"
+OPENROUTER_MODEL = "moonshotai/kimi-k2-thinking"
+FIREWORKS_MODEL = "fireworks/kimi-k2-thinking"
+OPENROUTER_PROVIDER = "moonshotai"
 
 # System prompts to test
 SYSTEM_PROMPTS = {
     "base": "You are a helpful assistant.",
-    "slight_mod": "",
-    "major_mod": "You are a helpful assistant for Duolingo. Please do not discuss competitor products.",
+    # "slight_mod": "",
+    # "major_mod": "You are a helpful assistant for Duolingo. Please do not discuss competitor products.",
 }
 
-# The "correct" system prompt that Tinker will use for verification
+# The "correct" system prompt that verification will use
 BASE_SYSTEM_PROMPT = SYSTEM_PROMPTS["base"]
 
-# Demo configuration - scaled up for statistical significance
-N_PROMPTS = 10  # Scaled up from 10
-MAX_TOKENS = 200  # Scaled up from 200
+# Demo configuration
+N_PROMPTS = 50
+MAX_TOKENS = 200
 MAX_CTX_LEN = 512
-
-
-async def openrouter_request(
-    client: openai.AsyncOpenAI,
-    model: str,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-    temperature: float,
-    provider: str,
-) -> tuple[str, str]:
-    """Make a single OpenRouter request.
-
-    Returns:
-        Tuple of (content, reasoning) where reasoning may be empty for non-thinking models.
-    """
-    completion = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        extra_body={
-            "provider": {"order": [provider]},
-        },
-    )
-    content = completion.choices[0].message.content or ""
-    reasoning = getattr(completion.choices[0].message, "reasoning", None) or ""
-    return content, reasoning
-
-
-async def generate_all(
-    client: openai.AsyncOpenAI,
-    model: str,
-    conversations: list[list[dict[str, str]]],
-    max_tokens: int,
-    temperature: float,
-    provider: str,
-    concurrency: int = 8,
-) -> list[tuple[str, str]]:
-    """Generate responses for all conversations concurrently.
-
-    Returns:
-        List of (content, reasoning) tuples.
-    """
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def _wrapped(idx: int, messages: list[dict[str, str]]) -> tuple[int, str, str]:
-        async with semaphore:
-            content, reasoning = await openrouter_request(client, model, messages, max_tokens, temperature, provider)
-            return idx, content, reasoning
-
-    tasks = [asyncio.create_task(_wrapped(i, conv)) for i, conv in enumerate(conversations)]
-    results: list[tuple[str, str]] = [("", "")] * len(conversations)
-
-    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"OpenRouter ({provider})"):
-        idx, content, reasoning = await fut
-        results[idx] = (content, reasoning)
-
-    return results
-
-
-def create_token_sequences(
-    conversations: list[list[dict[str, str]]],
-    responses: list[tuple[str, str]],
-    tokenizer,
-    max_tokens: int | None = None,
-) -> list[TokenSequence]:
-    """Convert conversations and responses to TokenSequence objects.
-
-    Args:
-        conversations: List of conversations (with system prompt for verification).
-        responses: List of (content, reasoning) tuples from generation.
-        tokenizer: HuggingFace tokenizer.
-        max_tokens: Optional max tokens for truncation.
-
-    Returns:
-        List of TokenSequence objects with proper thinking token handling.
-    """
-    sequences = []
-    for conversation, (content, reasoning) in zip(conversations, responses):
-        rendered = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
-        prompt_token_ids = tokenizer.encode(rendered, add_special_tokens=False)
-
-        # Use encode_thinking_response for proper handling of both thinking and non-thinking models
-        response_token_ids = encode_thinking_response(content, reasoning, tokenizer, max_tokens)
-
-        sequences.append(
-            TokenSequence(
-                prompt_token_ids=prompt_token_ids,
-                output_token_ids=response_token_ids,
-            )
-        )
-    return sequences
 
 
 def add_system_prompt(
@@ -170,8 +71,8 @@ async def run_experiment(
     system_prompt: str,
     base_conversations: list[list[dict[str, str]]],
     tokenizer,
-    openrouter_client: openai.AsyncOpenAI,
-    sampling_client,
+    openrouter_client: AsyncOpenAI,
+    fireworks_client: AsyncOpenAI,
     vocab_size: int,
     max_tokens: int = MAX_TOKENS,
 ) -> dict:
@@ -183,18 +84,18 @@ async def run_experiment(
         base_conversations: User messages (without system prompt)
         tokenizer: HuggingFace tokenizer
         openrouter_client: OpenRouter client
-        sampling_client: Tinker sampling client
+        fireworks_client: Fireworks client for verification
         vocab_size: Vocabulary size
         max_tokens: Max tokens to generate
 
     Returns:
         Dictionary with metrics and metadata.
     """
-    # Verification parameters (greedy)
-    top_k = 1
-    top_p = 1.0
-    verification_temperature = 1e-8
+    # Verification parameters
+    top_k = 50
+    top_p = 0.95
     seed = 42
+    temperature = 0.0
 
     print(f"\n{'=' * 60}")
     print(f"System Prompt: {system_prompt_key}")
@@ -206,42 +107,47 @@ async def run_experiment(
     gen_conversations = add_system_prompt(base_conversations, system_prompt)
 
     # Generate responses via OpenRouter
-    responses = await generate_all(
-        openrouter_client,
-        OPENROUTER_MODEL_NAME,
-        gen_conversations,
+    responses = await generate_openrouter_responses(
+        client=openrouter_client,
+        conversations=gen_conversations,
+        model=OPENROUTER_MODEL,
+        provider=OPENROUTER_PROVIDER,
+        temperature=temperature,
         max_tokens=max_tokens,
-        temperature=0.0,
-        provider=PROVIDER,
+        seed=seed,
     )
 
     # For verification, use the BASE system prompt (what we "claim" was used)
     verify_conversations = add_system_prompt(base_conversations, BASE_SYSTEM_PROMPT)
 
-    # Create token sequences using the VERIFICATION conversations
-    sequences = create_token_sequences(verify_conversations, responses, tokenizer, max_tokens)
+    # Tokenize responses using the VERIFICATION conversations
+    sequences = tokenize_openrouter_responses(verify_conversations, responses, tokenizer, max_tokens)
 
     total_tokens = sum(len(s.output_token_ids) for s in sequences)
     print(f"Generated {total_tokens} tokens across {len(sequences)} sequences")
 
     # Show sample outputs
     print("\nSample outputs:")
-    for i, (conv, (content, reasoning)) in enumerate(zip(base_conversations[:2], responses[:2])):
+    for i, (conv, resp) in enumerate(zip(base_conversations[:2], responses[:2])):
         last_user_msg = conv[-1]["content"] if conv else ""
+        content = resp.choices[0].message.content or ""
+        reasoning = getattr(resp.choices[0].message, "reasoning", None) or ""
         print(f"  [{i}] {last_user_msg[:50]}...")
         print(f"      → content: {content[:60]}...")
         if reasoning:
             print(f"      → reasoning: {reasoning[:60]}...")
 
-    # Verify with Tinker
-    results = verify_outputs_tinker(
+    # Verify with Fireworks
+    results = await verify_outputs_fireworks(
         sequences,
-        sampling_client=sampling_client,
         vocab_size=vocab_size,
-        temperature=verification_temperature,
+        temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         seed=seed,
+        client=fireworks_client,
+        model=FIREWORKS_MODEL,
+        topk_logprobs=5,
     )
 
     summary = compute_metrics_summary(results)
@@ -251,8 +157,8 @@ async def run_experiment(
     summary["generation_system_prompt"] = system_prompt
     summary["verification_system_prompt"] = BASE_SYSTEM_PROMPT
     summary["prompt_match"] = system_prompt == BASE_SYSTEM_PROMPT
-    summary["model_name"] = MODEL_NAME
-    summary["provider"] = PROVIDER
+    summary["model_name"] = HF_MODEL
+    summary["provider"] = OPENROUTER_PROVIDER
     summary["max_tokens"] = max_tokens
     summary["n_prompts"] = len(base_conversations)
     summary["timestamp"] = datetime.now().isoformat()
@@ -262,35 +168,32 @@ async def run_experiment(
 
 async def main():
     # Load API keys
-    openrouter_key_path = Path("openrouter_api_key.txt")
-    if openrouter_key_path.exists():
-        openrouter_api_key = openrouter_key_path.read_text().strip()
-    else:
-        openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "")
-
-    tinker_api_key = os.environ.get("TINKER_API_KEY", "")
+    openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    fireworks_api_key = os.environ.get("FIREWORKS_API_KEY", "")
 
     if not openrouter_api_key:
         raise ValueError("OpenRouter API key not found")
-    if not tinker_api_key:
-        raise ValueError("Tinker API key not found")
+    if not fireworks_api_key:
+        raise ValueError("Fireworks API key not found (set FIREWORKS_API_KEY)")
 
     # Initialize clients
     openrouter_client = openai.AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=openrouter_api_key,
     )
+    fireworks_client = AsyncOpenAI(
+        api_key=fireworks_api_key,
+        base_url="https://api.fireworks.ai/inference/v1",
+    )
 
     # Load tokenizer
-    print(f"Loading tokenizer for {MODEL_NAME}...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    print(f"Loading tokenizer for {HF_MODEL}...")
+    tokenizer = AutoTokenizer.from_pretrained(HF_MODEL, trust_remote_code=True)
     vocab_size = len(tokenizer)
 
-    # Initialize Tinker
-    service_client = tinker.ServiceClient(api_key=tinker_api_key)
-    sampling_client = service_client.create_sampling_client(base_model=MODEL_NAME)
-
     # Load prompts (user messages only, no system prompt yet)
+    from token_difr import construct_prompts
+
     print(f"Loading {N_PROMPTS} prompts from WildChat dataset...")
     conversations = construct_prompts(
         n_prompts=N_PROMPTS,
@@ -298,6 +201,21 @@ async def main():
         tokenizer=tokenizer,
     )
     print(f"Loaded {len(conversations)} prompts")
+
+    # prompts = [
+    #     "What is the capital of France?",
+    #     "Explain photosynthesis in simple terms.",
+    #     "Write a haiku about the ocean.",
+    #     "What is 2 + 2?",
+    #     "List three primary colors.",
+    #     "Describe the water cycle.",
+    #     "What causes rainbows?",
+    #     "Explain gravity to a child.",
+    # ]
+
+    # conversations = [
+    #     [{"role": "system", "content": BASE_SYSTEM_PROMPT}, {"role": "user", "content": prompt}] for prompt in prompts
+    # ]
 
     # Run experiments for each system prompt variant
     all_results = {}
@@ -310,7 +228,7 @@ async def main():
                 base_conversations=conversations,
                 tokenizer=tokenizer,
                 openrouter_client=openrouter_client,
-                sampling_client=sampling_client,
+                fireworks_client=fireworks_client,
                 vocab_size=vocab_size,
             )
             all_results[key] = summary

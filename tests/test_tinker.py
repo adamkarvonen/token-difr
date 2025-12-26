@@ -5,7 +5,7 @@ import os
 import pytest
 from transformers import AutoTokenizer
 
-from token_difr import TokenSequence, compute_metrics_summary, verify_outputs_api
+from token_difr import TokenSequence, compute_metrics_summary, verify_outputs_tinker
 
 # Load .env file if present
 try:
@@ -126,15 +126,16 @@ def test_verify_outputs_tinker(temperature):
     assert total_tokens > 0, "Should generate at least some tokens"
 
     # Verify outputs using Tinker backend
-    results = verify_outputs_api(
+    topk_logprobs = 20
+    results = verify_outputs_tinker(
         outputs,
-        backend="tinker",
         vocab_size=vocab_size,
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         seed=seed,
         sampling_client=sampling_client,
+        topk_logprobs=topk_logprobs,
     )
 
     # Check results structure
@@ -177,8 +178,8 @@ def test_verify_outputs_tinker(temperature):
     assert summary["avg_gumbel_rank"] >= 0.0
 
     # Check match rate
-    print(f"\nTemperature {temperature}: exact match rate = {summary['exact_match_rate']:.2%}")
+    model_name = MODEL_NAME.split("/")[-1]
+    print(f"\n{model_name} (Tinker->Tinker): exact match rate = {summary['exact_match_rate']:.2%}")
     assert summary["exact_match_rate"] >= min_match_rate, (
-        f"Temperature {temperature}: exact match rate {summary['exact_match_rate']:.2%} "
-        f"is below {min_match_rate:.0%} threshold"
+        f"{model_name}: exact match rate {summary['exact_match_rate']:.2%} is below {min_match_rate:.0%} threshold"
     )

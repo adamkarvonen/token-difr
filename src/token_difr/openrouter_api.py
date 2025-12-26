@@ -69,7 +69,7 @@ def tokenize_openrouter_responses(
     responses: list[ChatCompletion],
     tokenizer,
     max_tokens: int | None = None,
-) -> tuple[list[TokenSequence], int]:
+) -> list[TokenSequence]:
     """Convert OpenRouter responses to TokenSequence objects.
 
     Args:
@@ -79,9 +79,8 @@ def tokenize_openrouter_responses(
         max_tokens: Optional maximum tokens for response truncation.
 
     Returns:
-        Tuple of (outputs, vocab_size) where outputs is a list of TokenSequence.
+        List of TokenSequence objects.
     """
-    vocab_size = len(tokenizer)
     outputs = []
 
     for conv, completion in zip(conversations, responses, strict=True):
@@ -101,7 +100,7 @@ def tokenize_openrouter_responses(
 
         outputs.append(TokenSequence(prompt_token_ids=prompt_token_ids, output_token_ids=response_token_ids))
 
-    return outputs, vocab_size
+    return outputs
 
 
 def save_results(

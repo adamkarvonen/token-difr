@@ -126,12 +126,13 @@ def test_verify_outputs_fireworks(hf_model):
     fireworks_model, _, _ = MODEL_CONFIGS[hf_model]
     model_name = hf_model.split("/")[-1]
 
-    top_k = 5  # Fireworks default
+    top_k = 50
     top_p = 0.95
     seed = 42
     max_tokens = 100
     temperature = 0.0
     min_match_rate = 0.97
+    topk_logprobs = 5
 
     # Create Fireworks async client (for generation)
     client = AsyncOpenAI(
@@ -169,7 +170,7 @@ def test_verify_outputs_fireworks(hf_model):
             seed=seed,
             client=client,
             model=fireworks_model,
-            topk_logprobs=5,
+            topk_logprobs=topk_logprobs,
         )
     )
 
@@ -284,7 +285,8 @@ def test_verify_openrouter_generation_with_fireworks(hf_model):
     )
 
     # Tokenize responses
-    outputs, vocab_size = tokenize_openrouter_responses(conversations, responses, tokenizer, max_tokens)
+    outputs = tokenize_openrouter_responses(conversations, responses, tokenizer, max_tokens)
+    vocab_size = len(tokenizer)
 
     total_tokens = sum(len(o.output_token_ids) for o in outputs)
     assert total_tokens > 0, "Should generate at least some tokens"
