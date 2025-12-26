@@ -49,7 +49,7 @@ result = audit_provider(
 )
 
 print(result)
-# AuditResult(98.3% match rate, 18421 tokens across 100 sequences)
+# example AuditResult(98.3% match rate, 18421 tokens across 100 sequences)
 ```
 
 ## How It Works
@@ -68,17 +68,35 @@ All verification uses `temperature=0` (greedy decoding) because sampling seeds a
 class AuditResult:
     exact_match_rate: float  # Primary metric: fraction of tokens that match
     avg_prob: float          # Average probability of generated tokens
-    avg_margin: float        # Average score difference from top token
+    avg_margin: float        # Average log-prob difference from top token
     total_tokens: int        # Total tokens verified
     n_sequences: int         # Number of sequences verified
 ```
 
-**What to expect:**
-- **Matching models**: 97-99% exact match rate (small gaps due to tokenization edge cases)
-- **Mismatched models**: Significantly lower rates (often <90%)
-- **Quantization differences**: May cause 1-3% reduction in exact match
+## Interpreting Results
 
-The gap from 100% even for matching models comes from tokenization: when we receive text and re-tokenize it, there can be slight drift because `encode(decode(tokens))` doesn't always equal the original tokens.
+### What Scores Mean (and Don't Mean)
+
+The exact match rate is the primary metric because it's most interpretable: it measures what fraction of generated tokens exactly match what the reference provider would produce.
+
+**Important**: Low match rate scores indicate *divergence from reference*, not necessarily low quality. A high exact match rate (>98%) with a trusted reference can give high confidence in the provided model, but several factors can cause a low exact match rate.
+
+Divergence can occur for several reasons:
+
+| Cause | Typical Impact | How to Identify |
+|-------|---------------|-----------------|
+| Different system prompt | 5-20% drop | Consistent across all prompts |
+| Different tokenization format | 1-5% drop | Often affects prompt boundaries |
+| Quantization | 1-3% drop | Consistent small reduction |
+| Tokenization drift from re-encoding | 1-3% drop | Random distribution of mismatches |
+| Genuinely different model | 20%+ drop | Often correlates with semantic differences |
+
+### Setting Thresholds
+
+There's no universal threshold that separates "good" from "bad" providers. Instead:
+
+- **Baseline first**: Run the same model on multiple providers to establish what scores to expect
+- **Compare relatively**: A provider scoring 94% when others score 98% warrants investigation
 
 ## Model Registry
 
@@ -91,6 +109,8 @@ from token_difr import FIREWORKS_MODEL_REGISTRY
 print(FIREWORKS_MODEL_REGISTRY.keys())
 # dict_keys(['meta-llama/Llama-3.3-70B-Instruct', 'meta-llama/Llama-3.1-8B-Instruct', ...])
 ```
+
+In addition, OpenRouter sometimes uses different model names, but often just uses the lower case version of the HuggingFace name.
 
 ### Adding a New Model
 
