@@ -20,20 +20,24 @@ async def openrouter_request(
     max_tokens: int,
     temperature: float,
     provider: str,
+    seed: int | None = None,
 ) -> tuple[str, str]:
     """Make a single OpenRouter request.
 
     Returns:
         Tuple of (content, reasoning) where reasoning may be empty for non-thinking models.
     """
+    extra_body: dict = {
+        "provider": {"order": [provider]},
+    }
+
     completion = await client.chat.completions.create(
         model=model,
         messages=messages,  # type: ignore[arg-type]
         max_tokens=max_tokens,
         temperature=temperature,
-        extra_body={
-            "provider": {"order": [provider]},
-        },
+        seed=seed,
+        extra_body=extra_body,
     )
     content = completion.choices[0].message.content or ""
     reasoning = getattr(completion.choices[0].message, "reasoning", None) or ""
@@ -139,9 +143,7 @@ async def main():
             api_key=api_key,
         )
 
-        prompts = construct_prompts(
-            n_prompts=n_samples, max_ctx_len=max_ctx_len, model_name=model_name
-        )
+        prompts = construct_prompts(n_prompts=n_samples, max_ctx_len=max_ctx_len, model_name=model_name)
         print(f"Loaded {len(prompts)} prompts from dataset.")
 
         responses = await run_all_prompts(
