@@ -2,17 +2,15 @@
 
 import asyncio
 import os
-from dataclasses import dataclass
 
 import openai
 import pytest
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm as atqdm
-from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from token_difr import TokenSequence, compute_metrics_summary, encode_thinking_response, verify_outputs_fireworks
-from token_difr.openrouter_api import openrouter_request
+from token_difr import TokenSequence, compute_metrics_summary, verify_outputs_fireworks
+from token_difr.openrouter_api import generate_openrouter_responses, tokenize_openrouter_responses
 
 # Load .env file if present
 try:
@@ -232,60 +230,6 @@ def get_openrouter_api_key() -> str:
     return api_key
 
 
-async def generate_outputs_openrouter(
-    client: openai.AsyncOpenAI,
-    tokenizer,
-    prompts: list[str],
-    model: str,
-    provider: str,
-    temperature: float = 0.0,
-    max_tokens: int = 100,
-    concurrency: int = 8,
-    seed: int | None = None,
-) -> tuple[list[TokenSequence], int]:
-    """Generate outputs using OpenRouter API.
-
-    Uses openrouter_request from token_difr.openrouter_api.
-
-    Returns:
-        Tuple of (outputs, vocab_size).
-    """
-    vocab_size = len(tokenizer)
-    semaphore = asyncio.Semaphore(concurrency)
-
-    # Add a default system prompt to ensure consistent behavior between OpenRouter and
-    # HuggingFace tokenization. Without an explicit system prompt, HuggingFace's
-    # apply_chat_template may add a model-specific default, while OpenRouter won't.
-    default_system_prompt = "You are a helpful assistant."
-    conversations = [
-        [{"role": "system", "content": default_system_prompt}, {"role": "user", "content": p}] for p in prompts
-    ]
-
-    async def _wrapped(idx: int, messages: list[dict[str, str]]) -> tuple[int, str, str]:
-        async with semaphore:
-            content, reasoning = await openrouter_request(
-                client, model, messages, max_tokens, temperature, provider, seed=seed
-            )
-            return idx, content, reasoning
-
-    tasks = [asyncio.create_task(_wrapped(i, conv)) for i, conv in enumerate(conversations)]
-    results: list[tuple[str, str]] = [("", "")] * len(conversations)
-
-    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"OpenRouter ({provider})"):
-        idx, content, reasoning = await fut
-        results[idx] = (content, reasoning)
-
-    # Convert to TokenSequence
-    outputs = []
-    for conv, (content, reasoning) in zip(conversations, results):
-        rendered = tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
-        prompt_token_ids = tokenizer.encode(rendered, add_special_tokens=False)
-        response_token_ids = encode_thinking_response(content, reasoning, tokenizer, max_tokens)
-        outputs.append(TokenSequence(prompt_token_ids=prompt_token_ids, output_token_ids=response_token_ids))
-
-    return outputs, vocab_size
-
-
 @pytest.mark.parametrize(
     "hf_model",
     list(MODEL_CONFIGS.keys()),
@@ -318,14 +262,17 @@ def test_verify_openrouter_generation_with_fireworks(hf_model):
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
-    vocab_size = len(tokenizer)
+
+    conversations = []
+    for prompt in TEST_PROMPTS:
+        messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+        conversations.append(messages)
 
     # Generate via OpenRouter with Fireworks as provider
-    outputs, vocab_size = asyncio.run(
-        generate_outputs_openrouter(
+    responses = asyncio.run(
+        generate_openrouter_responses(
             client=openrouter_client,
-            tokenizer=tokenizer,
-            prompts=TEST_PROMPTS,
+            conversations=conversations,
             model=openrouter_model,
             provider="fireworks",
             temperature=temperature,
@@ -333,6 +280,9 @@ def test_verify_openrouter_generation_with_fireworks(hf_model):
             seed=seed,
         )
     )
+
+    # Tokenize responses
+    outputs, vocab_size = tokenize_openrouter_responses(conversations, responses, tokenizer, max_tokens)
 
     total_tokens = sum(len(o.output_token_ids) for o in outputs)
     assert total_tokens > 0, "Should generate at least some tokens"
