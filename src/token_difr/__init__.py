@@ -27,7 +27,7 @@ from token_difr.model_registry import (
 from token_difr.openrouter_api import tokenize_openrouter_responses
 from token_difr.local import verify_outputs
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     # High-level audit API
