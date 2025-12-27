@@ -123,7 +123,7 @@ def save_results(
         max_tokens: Maximum tokens for response truncation.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    outputs, _ = tokenize_openrouter_responses(conversations, responses, tokenizer, max_tokens)
+    outputs = tokenize_openrouter_responses(conversations, responses, tokenizer, max_tokens)
     del tokenizer
 
     vllm_samples = [

@@ -1,5 +1,7 @@
 import json
+import os
 from dataclasses import asdict
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -21,7 +23,7 @@ PROVIDERS = [
 ]
 
 # Audit parameters
-N_PROMPTS = 10
+N_PROMPTS = 100
 MAX_TOKENS = 200
 SEED = 42
 TOP_K = 50
@@ -57,7 +59,10 @@ def main():
     }
 
     safe_model_name = HF_MODEL.replace("/", "_")
-    output_file = f"{safe_model_name}_audit_results.json"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = "audit_results"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = f"{output_dir}/{safe_model_name}_audit_results_{timestamp}.json"
 
     # Write initial file so we can watch progress
     save_results(results, output_file)

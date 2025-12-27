@@ -24,6 +24,8 @@ dependencies = [
     "torch>=2.0.0",
     "tqdm>=4.0.0",
     "tinker",
+    "openai>=1.0.0",
+    "transformers>=4.30.0",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +35,6 @@ all = [
 dev = [
     "pytest>=7.0.0",
     "ruff>=0.1.0",
-    "openai>=2.14.0",
     "ipykernel==6.29.0"
 ]
 
